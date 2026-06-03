@@ -1,0 +1,19 @@
+Dockerfile
+  s_2d99d3ce4c8db8::t_b64b4c0728d2df 12,17
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "46e697e5336d023f21830864470f35cead56c182",
+  "prompts": {},
+  "sessions": {
+    "s_2d99d3ce4c8db8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "36f388d2-0007-4417-9ff1-4190a15b987c",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Stefan Rosenlund <mail@stefanrosenlund.dk>"
+    }
+  }
+}
