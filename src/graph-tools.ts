@@ -16,7 +16,7 @@ import { fileURLToPath } from 'url';
 import { TOOL_CATEGORIES } from './tool-categories.js';
 import { getRequestTokens } from './request-context.js';
 import { parseTeamsUrl } from './lib/teams-url-parser.js';
-import { applyDefaultSelect } from './default-query-params.js';
+import { applyDefaultSelect, stripSelectFromPath, isSelectError } from './default-query-params.js';
 import { buildBM25Index, scoreQuery, tokenize, type BM25Index } from './lib/bm25.js';
 export interface DiscoverySearchIndex {
   bm25: BM25Index;
@@ -448,9 +448,8 @@ async function executeGraphTool(
       }
     }
 
-    if (httpMethod === 'GET') {
-      applyDefaultSelect(config?.llmTip, queryParams);
-    }
+    const injectedDefaultSelect =
+      httpMethod === 'GET' ? applyDefaultSelect(tool.alias, config?.llmTip, queryParams) : false;
     clampTopQueryParam(queryParams);
 
     const preferValues: string[] = [];
@@ -566,6 +565,17 @@ async function executeGraphTool(
     );
 
     let response = await graphClient.graphRequest(path, options);
+
+    // If a default $select we injected is rejected by Graph (e.g. a field that does not exist on
+    // this resource), retry once without it so the call still succeeds with the full response.
+    if (injectedDefaultSelect && response?.isError) {
+      const errText = response.content?.[0]?.text ?? '';
+      if (isSelectError(errText)) {
+        const fallbackPath = stripSelectFromPath(path);
+        logger.warn(`Default $select rejected by Graph; retrying without it for ${tool.alias}`);
+        response = await graphClient.graphRequest(fallbackPath, options);
+      }
+    }
 
     const fetchAllPages = params.fetchAllPages === true;
     if (fetchAllPages && response?.content?.[0]?.text) {
