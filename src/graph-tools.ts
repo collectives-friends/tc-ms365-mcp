@@ -16,6 +16,7 @@ import { fileURLToPath } from 'url';
 import { TOOL_CATEGORIES } from './tool-categories.js';
 import { getRequestTokens } from './request-context.js';
 import { parseTeamsUrl } from './lib/teams-url-parser.js';
+import { applyDefaultSelect } from './default-query-params.js';
 import { buildBM25Index, scoreQuery, tokenize, type BM25Index } from './lib/bm25.js';
 export interface DiscoverySearchIndex {
   bm25: BM25Index;
@@ -447,6 +448,9 @@ async function executeGraphTool(
       }
     }
 
+    if (httpMethod === 'GET') {
+      applyDefaultSelect(config?.llmTip, queryParams);
+    }
     clampTopQueryParam(queryParams);
 
     const preferValues: string[] = [];
