@@ -1,0 +1,19 @@
+CLAUDE.md
+  s_873085e61c06b7::t_d9c89a67c7e387 1-7
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "69fd5deb1fc6a4cc525900d6efee8a18fb51d9ce",
+  "prompts": {},
+  "sessions": {
+    "s_873085e61c06b7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "03bd50f8-a59a-4548-a695-9c3459604542",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Stefan Rosenlund <mail@stefanrosenlund.dk>"
+    }
+  }
+}
