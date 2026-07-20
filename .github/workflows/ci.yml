@@ -1,3 +1,5 @@
+# GENERERET af collectives-friends/.github ci-sync/sync.sh. Rediger IKKE her.
+# Aendr manifest.json + sync.sh og koer sync paa ny.
 name: ci
 on:
   pull_request:
@@ -6,9 +8,22 @@ on:
     branches: [main]
 jobs:
   ci:
-    uses: collectives-friends/.github/.github/workflows/node-ci.yml@main
-    with:
-      package-manager: "npm"
-      node-version: "22"
-      setup-cmd: "npm run generate"
-      typecheck-cmd: "npm run build"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+      - name: Install
+        run: npm ci
+      - name: Setup
+        run: npm run generate
+      - name: Lint
+        run: npm run lint
+      - name: Format-check
+        run: npm run format:check
+      - name: Test
+        run: npm run test
+      - name: Build
+        run: npm run build
