@@ -1,0 +1,19 @@
+package-lock.json
+  s_7507bc063f76b9::t_d7c1ec22f97752 13060-13077,13456-13473,13649-13666
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "94144034783e2a1e2f9bfd0b8581cd2c63db1fcf",
+  "prompts": {},
+  "sessions": {
+    "s_7507bc063f76b9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8df541d9-ed6f-4313-8a16-d4d12c863010",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Stefan Rosenlund <mail@stefanrosenlund.dk>"
+    }
+  }
+}
