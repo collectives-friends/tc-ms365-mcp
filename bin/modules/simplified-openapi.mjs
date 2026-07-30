@@ -1,6 +1,16 @@
 import fs from 'fs';
 import yaml from 'js-yaml';
 
+// DC fork (2026-07-30): the per-ref/per-property logging below fires tens of
+// thousands of times across the full Microsoft Graph schema. That's fine on
+// GitHub Actions runners but makes Sliplane's Railpack builder appear to hang
+// (log-shipping overhead dominates wall-clock). Gate it behind an env var —
+// set GENERATE_VERBOSE=1 locally if you need the old per-ref trace output.
+const VERBOSE = process.env.GENERATE_VERBOSE === '1';
+function verboseLog(...args) {
+  if (VERBOSE) console.log(...args);
+}
+
 export function createAndSaveSimplifiedOpenAPI(endpointsFile, openapiFile, openapiTrimmedFile) {
   const allEndpoints = JSON.parse(fs.readFileSync(endpointsFile, 'utf8'));
   const endpoints = allEndpoints.filter((endpoint) => !endpoint.disabled);
@@ -185,14 +195,14 @@ function simplifyAnyOfSchema(schema, context) {
     );
 
     if (hasRef && hasNullableObject) {
-      console.log(`Simplifying anyOf in ${context} (ref + nullable object pattern)`);
+      verboseLog(`Simplifying anyOf in ${context} (ref + nullable object pattern)`);
       const refItem = anyOfItems.find((item) => item.$ref);
       delete schema.anyOf;
       schema.$ref = refItem.$ref;
       schema.nullable = true;
     }
   } else if (anyOfItems.length > 2) {
-    console.log(`Simplifying anyOf in ${context} (multiple options)`);
+    verboseLog(`Simplifying anyOf in ${context} (multiple options)`);
     schema.type = anyOfItems[0].type || 'object';
     schema.nullable = true;
     schema.description = `${schema.description || ''} [Simplified from ${
@@ -233,14 +243,14 @@ function flattenComplexSchema(schema, schemaName) {
       );
 
       if (hasRef && hasNullableObject) {
-        console.log(`Simplifying anyOf in ${schemaName} (ref + nullable object pattern)`);
+        verboseLog(`Simplifying anyOf in ${schemaName} (ref + nullable object pattern)`);
         const refItem = schema.anyOf.find((item) => item.$ref);
         delete schema.anyOf;
         schema.$ref = refItem.$ref;
         schema.nullable = true;
       }
     } else if (schema.anyOf.length > 2) {
-      console.log(`Simplifying anyOf in ${schemaName} (${schema.anyOf.length} options)`);
+      verboseLog(`Simplifying anyOf in ${schemaName} (${schema.anyOf.length} options)`);
       const firstOption = schema.anyOf[0];
       schema.type = firstOption.type || 'object';
       schema.nullable = true;
@@ -252,7 +262,7 @@ function flattenComplexSchema(schema, schemaName) {
   }
 
   if (schema.oneOf && Array.isArray(schema.oneOf) && schema.oneOf.length > 2) {
-    console.log(`Simplifying oneOf in ${schemaName} (${schema.oneOf.length} options)`);
+    verboseLog(`Simplifying oneOf in ${schemaName} (${schema.oneOf.length} options)`);
     const firstOption = schema.oneOf[0];
     schema.type = firstOption.type || 'object';
     schema.nullable = true;
@@ -274,7 +284,7 @@ function reduceProperties(schema, schemaName) {
   const propertyCount = Object.keys(properties).length;
 
   if (propertyCount > 25) {
-    console.log(`Reducing properties in ${schemaName} (${propertyCount} -> 25)`);
+    verboseLog(`Reducing properties in ${schemaName} (${propertyCount} -> 25)`);
 
     const priorityProperties = [
       'id',
@@ -366,7 +376,7 @@ function mergeAllOfSchemas(allOfArray, allSchemas, visited = new Set()) {
 
       const refSchema = allSchemas[refSchemaName];
       if (refSchema) {
-        console.log(
+        verboseLog(
           `Processing ref ${refSchemaName} for ${item.title}, exists: true, has properties: ${!!refSchema.properties}, has allOf: ${!!refSchema.allOf}`
         );
 
@@ -382,7 +392,7 @@ function mergeAllOfSchemas(allOfArray, allSchemas, visited = new Set()) {
         }
 
         if (refSchema.properties) {
-          console.log(`Ensuring ${item.title} has all required properties from ${refSchemaName}`);
+          verboseLog(`Ensuring ${item.title} has all required properties from ${refSchemaName}`);
           Object.assign(merged.properties, refSchema.properties);
         }
         if (refSchema.required) {
@@ -417,7 +427,7 @@ function simplifyNestedPropertiesRecursively(properties, currentDepth = 0, maxDe
 
     if (prop && typeof prop === 'object') {
       if (currentDepth === maxDepth - 1 && prop.properties) {
-        console.log(`Flattening nested property at depth ${currentDepth}: ${key}`);
+        verboseLog(`Flattening nested property at depth ${currentDepth}: ${key}`);
         prop.type = 'object';
         prop.description = `${prop.description || ''} [Simplified: nested object]`.trim();
         delete prop.properties;
@@ -435,7 +445,7 @@ function simplifyNestedPropertiesRecursively(properties, currentDepth = 0, maxDe
           );
 
           if (hasRef && hasNullableObject) {
-            console.log(`Simplifying anyOf in property ${key} (ref + nullable object pattern)`);
+            verboseLog(`Simplifying anyOf in property ${key} (ref + nullable object pattern)`);
             const refItem = prop.anyOf.find((item) => item.$ref);
             delete prop.anyOf;
             prop.$ref = refItem.$ref;
