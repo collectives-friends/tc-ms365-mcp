@@ -1,0 +1,19 @@
+.github/workflows/auto-update.yml
+  s_7dd1331c8e6c80::t_02ed72c6f6aa87 37,42,44
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.21",
+  "base_commit_sha": "d4eeaea34b68ef0bd1de281c7b3d0d04f772eb55",
+  "prompts": {},
+  "sessions": {
+    "s_7dd1331c8e6c80": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "e13ef17a-d4c9-4c49-b5d0-718d8851d043",
+        "model": "grok-4.5"
+      },
+      "human_author": "Stefan Rosenlund <mail@stefanrosenlund.dk>"
+    }
+  }
+}
