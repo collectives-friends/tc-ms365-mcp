@@ -1,10 +1,12 @@
 name: auto-update
 on:
   schedule:
-    - cron: '23 4 * * 1'   # mandag 04:23 UTC
+    - cron: "23 4 * * 1" # mandag 04:23 UTC
   workflow_dispatch:
 permissions:
   contents: write
+  pull-requests: write
+  issues: write
   actions: write
 jobs:
   sync:
@@ -12,23 +14,46 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
-      - name: Merge upstream (Softeria)
+      - name: Merge upstream (Softeria) into PR branch
         id: merge
+        env: { GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
         run: |
+          set -euo pipefail
           git config user.name "auto-update"
           git config user.email "auto-update@users.noreply.github.com"
           git remote add upstream https://github.com/Softeria/ms-365-mcp-server.git
-          git fetch upstream
+          git fetch upstream main
+          BRANCH="auto-update/upstream-$(date -u +%Y%m%d)"
+          git checkout -B "$BRANCH"
           BEFORE=$(git rev-parse HEAD)
-          if ! git merge --no-edit upstream/main; then
-            echo "::error::Merge-konflikt med upstream — kraever manuel resolution"
-            git merge --abort; exit 1
+          if git merge --no-edit upstream/main; then
+            AFTER=$(git rev-parse HEAD)
+            if [ "$BEFORE" = "$AFTER" ]; then
+              echo "status=noop" >> "$GITHUB_OUTPUT"
+              echo "Ingen nye upstream-commits."
+              exit 0
+            fi
+            git push -u origin "$BRANCH"
+            gh pr create --title "chore: sync upstream Softeria/ms-365-mcp-server" \
+              --body "Automatisk upstream-merge. Review Infisical/Dockerfile TC-ændringer før merge. docker-publish trigges ved merge til main." \
+              --base main --head "$BRANCH" || true
+            echo "status=pr" >> "$GITHUB_OUTPUT"
+          else
+            git merge --abort || true
+            TITLE="auto-update: upstream merge-konflikt $(date -u +%Y-%m-%d)"
+            BODY=$(cat <<EOF
+          Weekly upstream merge fra Softeria/ms-365-mcp-server fejlede med konflikt.
+          TC-fork har Infisical/codegen-ændringer der divergerer.
+          Manuel resolution kræves.
+          Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EOF
+          )
+            EXISTING=$(gh issue list --search "auto-update: upstream merge-konflikt in:title" --state open --json number --jq '.[0].number')
+            if [ -z "$EXISTING" ]; then
+              gh issue create --title "$TITLE" --body "$BODY"
+            else
+              gh issue comment "$EXISTING" --body "$BODY"
+            fi
+            echo "status=conflict" >> "$GITHUB_OUTPUT"
+            echo "::notice::Upstream merge-konflikt — issue oprettet/opdateret (job exits 0)"
           fi
-          AFTER=$(git rev-parse HEAD)
-          [ "$BEFORE" != "$AFTER" ] && echo "changed=true" >> $GITHUB_OUTPUT || echo "changed=false" >> $GITHUB_OUTPUT
-      - name: Push + trigger build
-        if: steps.merge.outputs.changed == 'true'
-        env: { GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
-        run: |
-          git push origin HEAD:main
-          gh workflow run docker-publish.yml --repo ${{ github.repository }}
