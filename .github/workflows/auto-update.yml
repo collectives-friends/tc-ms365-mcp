@@ -6,7 +6,6 @@ on:
 permissions:
   contents: write
   pull-requests: write
-  issues: write
   actions: write
 jobs:
   sync:
@@ -35,25 +34,12 @@ jobs:
             fi
             git push -u origin "$BRANCH"
             gh pr create --title "chore: sync upstream Softeria/ms-365-mcp-server" \
-              --body "Automatisk upstream-merge. Review Infisical/Dockerfile TC-ændringer før merge. docker-publish trigges ved merge til main." \
+              --body "Automatisk upstream-merge. Review Infisical/Dockerfile TC-ændringer før merge." \
               --base main --head "$BRANCH" || true
             echo "status=pr" >> "$GITHUB_OUTPUT"
           else
             git merge --abort || true
-            TITLE="auto-update: upstream merge-konflikt $(date -u +%Y-%m-%d)"
-            BODY=$(cat <<EOF
-          Weekly upstream merge fra Softeria/ms-365-mcp-server fejlede med konflikt.
-          TC-fork har Infisical/codegen-ændringer der divergerer.
-          Manuel resolution kræves.
-          Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          EOF
-          )
-            EXISTING=$(gh issue list --search "auto-update: upstream merge-konflikt in:title" --state open --json number --jq '.[0].number')
-            if [ -z "$EXISTING" ]; then
-              gh issue create --title "$TITLE" --body "$BODY"
-            else
-              gh issue comment "$EXISTING" --body "$BODY"
-            fi
+            echo "::notice::Upstream merge-konflikt (Softeria). TC-fork divergerer (Infisical/codegen). Manuel sync kræves."
             echo "status=conflict" >> "$GITHUB_OUTPUT"
-            echo "::notice::Upstream merge-konflikt — issue oprettet/opdateret (job exits 0)"
+            exit 0
           fi
