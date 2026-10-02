@@ -1,0 +1,16 @@
+name: health-monitor
+on:
+  schedule:
+    - cron: '0 */6 * * *'   # hver 6. time
+  workflow_dispatch:
+permissions: {}
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Smoke test public MCP ingress
+        run: |
+          # Flyttet fra collectives-friends/tc-pipedrive-oauth (TCO-66), da den proxy pensioneres.
+          c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 https://ms365-mcp-server.sliplane.app/.well-known/oauth-authorization-server)
+          echo "ms365-oauth: got $c want 200"
+          [ "$c" = "200" ] || { echo "::error::ms365-mcp-server er nede"; exit 1; }
