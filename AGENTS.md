@@ -15,10 +15,11 @@ Fork af `softeria/ms-365-mcp-server` (npm-navn stadig `@softeria/ms-365-mcp-serv
 - Nye/ændrede tools: følg Anthropic search+execute-pattern + korrekt auth/elicitation, ikke ad-hoc tool-lister.
 - `.claude/rules/` findes allerede til path-scoped regler; læg finkornede regler dér.
 
-## Secrets · Infisical universal-auth
+## Secrets · Key Vault + Sliplane env
 
-- Container-entry er `infisical-entrypoint.sh`: logger ind med `INFISICAL_CLIENT_ID`/`INFISICAL_CLIENT_SECRET` (universal-auth) mod `INFISICAL_API_URL`, henter `INFISICAL_PROJECT_ID`/`INFISICAL_ENV`, kører `node dist/index.js`.
-- **Nul secrets i git.** `.env.example` viser formen; udfyld aldrig rigtige værdier. Aldrig server-secrets i klienten.
+- Source of truth: Azure Key Vault `tc-data-kv-tc`, names `ms365-mcp-server--<ENV-NAME>` (underscores → dashes), 1:1 with the env names (MS365_MCP_CLIENT_ID/\_SECRET/\_TENANT_ID/\_ORG_MODE/\_PUBLIC_URL/\_ALLOWED_REDIRECT_URIS). Tagged with expires.
+- Runtime: values are set as Sliplane env (secret=true for CLIENT_SECRET). The container starts with `node dist/index.js --http :3000`. Infisical is no longer used (it was shut down 2026-10).
+- Entra app: TC Claude Code (ee95c1be-…). On client-secret rotation: new secret → KV → Sliplane env → redeploy.
 
 ## Deploy
 
