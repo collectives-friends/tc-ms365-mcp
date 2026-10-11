@@ -16,7 +16,8 @@ Fork af `softeria/ms-365-mcp-server` (npm-navn stadig `@softeria/ms-365-mcp-serv
 - `.claude/rules/` findes allerede til path-scoped regler; læg finkornede regler dér.
 
 ## Secrets · Key Vault + Sliplane env
-- Source of truth: Azure Key Vault `tc-data-kv-tc`, names `ms365-mcp-server--<ENV-NAME>` (underscores → dashes), 1:1 with the env names (MS365_MCP_CLIENT_ID/_SECRET/_TENANT_ID/_ORG_MODE/_PUBLIC_URL/_ALLOWED_REDIRECT_URIS). Tagged with expires.
+
+- Source of truth: Azure Key Vault `tc-data-kv-tc`, names `ms365-mcp-server--<ENV-NAME>` (underscores → dashes), 1:1 with the env names (MS365_MCP_CLIENT_ID/\_SECRET/\_TENANT_ID/\_ORG_MODE/\_PUBLIC_URL/\_ALLOWED_REDIRECT_URIS). Tagged with expires.
 - Runtime: values are set as Sliplane env (secret=true for CLIENT_SECRET). The container starts with `node dist/index.js --http :3000`. Infisical is no longer used (it was shut down 2026-10).
 - Entra app: TC Claude Code (ee95c1be-…). On client-secret rotation: new secret → KV → Sliplane env → redeploy.
 
