@@ -22,6 +22,10 @@ function topN(query: string, n: number): string[] {
     .map((r) => r.id);
 }
 
+function top1(query: string): string | undefined {
+  return topN(query, 1)[0];
+}
+
 type Case = { query: string; expect: string; inTop?: number };
 
 const cases: Case[] = [
@@ -33,9 +37,22 @@ const cases: Case[] = [
   { query: 'read mail message', expect: 'get-mail-message', inTop: 5 },
   { query: 'delete mail', expect: 'delete-mail-message', inTop: 5 },
   { query: 'list mail folders', expect: 'list-mail-folders', inTop: 3 },
+  // Semantic mail queries. The Microsoft-supplied base descriptions for these six
+  // /me/messages operations are mis-sourced (openTypeExtension / eventMessage blurbs),
+  // so these rely on the descriptionOverride entries in endpoints.json.
+  { query: 'search my inbox for an email', expect: 'list-mail-messages', inTop: 5 },
+  { query: 'read the full body of an email', expect: 'get-mail-message', inTop: 5 },
+  { query: 'save a draft email', expect: 'create-draft-email', inTop: 5 },
+  { query: 'mark email as read', expect: 'update-mail-message', inTop: 5 },
+  { query: 'move email to deleted items', expect: 'delete-mail-message', inTop: 5 },
+  { query: 'raw mime source of a message', expect: 'get-mail-message-mime', inTop: 5 },
   // Calendar
   { query: 'create calendar event', expect: 'create-calendar-event', inTop: 5 },
   { query: 'create event', expect: 'create-calendar-event', inTop: 5 },
+  // Semantic queries that don't contain the tool name — these rely on the description
+  // override (the Microsoft-supplied base description leads with unrelated boilerplate).
+  { query: 'schedule a meeting', expect: 'create-calendar-event', inTop: 5 },
+  { query: 'add appointment to calendar', expect: 'create-calendar-event', inTop: 5 },
   { query: 'list calendars', expect: 'list-calendars', inTop: 3 },
   { query: 'list calendar events', expect: 'list-calendar-events', inTop: 5 },
   { query: 'accept event', expect: 'accept-calendar-event', inTop: 5 },
@@ -51,6 +68,9 @@ const cases: Case[] = [
   { query: 'onedrive folder', expect: 'create-onedrive-folder', inTop: 10 },
   { query: 'upload file', expect: 'upload-file-content', inTop: 5 },
   { query: 'download file', expect: 'download-bytes', inTop: 5 },
+  { query: 'download drive file', expect: 'get-download-url', inTop: 1 },
+  { query: 'sharepoint file download', expect: 'get-download-url', inTop: 1 },
+  { query: 'large drive file', expect: 'get-download-url', inTop: 1 },
   { query: 'download bytes', expect: 'download-bytes', inTop: 5 },
   { query: 'profile photo', expect: 'download-bytes', inTop: 10 },
   { query: 'parse teams url', expect: 'parse-teams-url', inTop: 5 },
@@ -79,6 +99,12 @@ describe('discovery search (golden queries)', () => {
 
   it('returns empty for gibberish queries', () => {
     expect(scoreDiscoveryQuery('zzzqqqxxxfoobarbaz', index)).toEqual([]);
+  });
+
+  it('prefers out-of-band URLs for drive and SharePoint file download queries', () => {
+    expect(top1('download drive file')).toBe('get-download-url');
+    expect(top1('sharepoint file download')).toBe('get-download-url');
+    expect(top1('large drive file')).toBe('get-download-url');
   });
 
   it('covers at least 80% of golden queries in top 5', () => {
