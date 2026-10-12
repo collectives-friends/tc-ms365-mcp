@@ -268,10 +268,21 @@ function deferredSummary(driveId: string): DriveSyncSummary {
   return { ...emptySummary(driveId), status: 'deferred', moreRemaining: true };
 }
 
+// Only genuine work (new or changed entries) counts against the run's item
+// budget. Re-walked unchanged entries are free, so a run that stops at the
+// budget still makes real progress on the next run, even without a stored
+// cursor; a feed that fits inside the budget completes and stores its token.
+function processedWork(summary: DriveSyncSummary): number {
+  return summary.folders + summary.indexed + summary.skipped + summary.deleted + summary.errors;
+}
+
 /**
- * Worst case one Graph page of items is processed per run: a page that does
- * not finish inside the item budget is abandoned without persisting its delta
- * token, so the next run re-reads it (changed items are hash-skipped).
+ * The item budget bounds work per run (downloads, extraction, embeddings), not
+ * items walked: entries that are already indexed, already skipped or no longer
+ * present cost only a metadata comparison, so a run that stops at the budget
+ * advances through them for free next time instead of re-spending its whole
+ * budget on the same prefix. A run that walks the feed to the end within
+ * budget persists the delta token.
  */
 async function syncDrive(
   deps: SearchIndexDeps,
@@ -302,14 +313,14 @@ async function syncDrive(
         : `/drives/${driveId}/root/delta`;
     let more = false;
     while (url) {
-      if (summary.seen >= options.maxItems || Date.now() > options.deadline) {
+      if (processedWork(summary) >= options.maxItems || Date.now() > options.deadline) {
         more = true;
         break;
       }
       const page = asRecord(await deps.graph.makeRequest(url, { accessToken }));
       const items = Array.isArray(page?.value) ? page.value.filter(isRecord) : [];
       for (const item of items) {
-        if (summary.seen >= options.maxItems) {
+        if (processedWork(summary) >= options.maxItems) {
           more = true;
           break;
         }
@@ -425,13 +436,23 @@ async function applyDeltaItem(
   const itemId = asString(item.id);
   if (!itemId) return;
   if (item.deleted !== undefined) {
-    active.store.deleteItemWithChunks(itemId);
-    summary.deleted += 1;
+    if (active.store.getItem(itemId)) {
+      active.store.deleteItemWithChunks(itemId);
+      summary.deleted += 1;
+    } else {
+      // Deleted before we ever indexed it: nothing to remove, so no work.
+      summary.unchanged += 1;
+    }
     return;
   }
 
   const metadata = deltaItemMetadata(item);
   if (item.folder !== undefined) {
+    const existing = active.store.getItem(itemId);
+    if (existing && existing.state === 'folder' && isUnchanged(existing, metadata)) {
+      summary.unchanged += 1;
+      return;
+    }
     active.store.upsertItem({
       itemId,
       driveId,
@@ -444,11 +465,32 @@ async function applyDeltaItem(
   }
   if (item.file === undefined) {
     // Packages (OneNote etc.) and other non-file entries are not documents.
+    if (isSkippedUnchanged(active.store.getItem(itemId), metadata, 'package')) {
+      summary.unchanged += 1;
+      return;
+    }
+    active.store.upsertItem({
+      itemId,
+      driveId,
+      parentId: metadata.parentId,
+      name: metadata.name,
+      webUrl: metadata.webUrl,
+      size: metadata.size,
+      lastModified: metadata.lastModified,
+      mime: metadata.mime,
+      quickxor: metadata.quickxor,
+      state: 'skipped',
+      skipReason: 'package',
+    });
     summary.skipped += 1;
     return;
   }
 
   if (!metadata.kind) {
+    if (isSkippedUnchanged(active.store.getItem(itemId), metadata, 'unsupported')) {
+      summary.unchanged += 1;
+      return;
+    }
     active.store.upsertItem({
       itemId,
       driveId,
@@ -466,6 +508,10 @@ async function applyDeltaItem(
     return;
   }
   if (metadata.size !== undefined && metadata.size > active.config.maxFileBytes) {
+    if (isSkippedUnchanged(active.store.getItem(itemId), metadata, 'too_large')) {
+      summary.unchanged += 1;
+      return;
+    }
     active.store.upsertItem({
       itemId,
       driveId,
@@ -553,6 +599,21 @@ function isUnchanged(existing: ItemRecord, fresh: DeltaItemMetadata): boolean {
   if (existing.name !== fresh.name || existing.parentId !== fresh.parentId) return false;
   if (fresh.quickxor && existing.quickxor) return fresh.quickxor === existing.quickxor;
   return existing.size === fresh.size && existing.lastModified === fresh.lastModified;
+}
+
+// A skipped entry (unsupported type, too large, package) needs no work again
+// until its metadata changes or the skip reason no longer applies.
+function isSkippedUnchanged(
+  existing: ItemRecord | undefined,
+  fresh: DeltaItemMetadata,
+  reason: string
+): boolean {
+  return Boolean(
+    existing &&
+    existing.state === 'skipped' &&
+    existing.skipReason === reason &&
+    isUnchanged(existing, fresh)
+  );
 }
 
 function resolveItemPath(

@@ -606,7 +606,9 @@ describe.skipIf(!sqliteAvailable)('index runtime with fake Graph and embeddings'
     expect(summary.folders).toBe(1);
     expect(summary.indexed).toBe(1);
     expect(summary.skipped).toBe(1);
-    expect(summary.deleted).toBe(1);
+    // The deletion refers to an item that was never indexed: nothing to remove.
+    expect(summary.deleted).toBe(0);
+    expect(summary.unchanged).toBe(1);
     expect(summary.moreRemaining).toBe(false);
 
     const status = searchIndexStatus(env);
@@ -624,14 +626,65 @@ describe.skipIf(!sqliteAvailable)('index runtime with fake Graph and embeddings'
     expect(search.hits[0].path).toBe('/Documents/General/notes.txt');
     expect(search.hits[0].snippet).toContain('Alpha');
 
-    // A second run with the same page reports an unchanged item and reuses the token.
+    // A second run with the same page reports the folder, the notes file, the
+    // unsupported file and the phantom deletion as unchanged and reuses the token.
     const second = await refreshSearchIndex(deps, {});
-    expect(second.drives[0].unchanged).toBe(1);
+    expect(second.drives[0].unchanged).toBe(4);
     expect(second.drives[0].indexed).toBe(0);
+    expect(second.drives[0].folders).toBe(0);
+    expect(second.drives[0].skipped).toBe(0);
+    expect(second.drives[0].deleted).toBe(0);
     const deltaCalls = (graph.makeRequest as unknown as { mock: { calls: unknown[][] } }).mock.calls
       .map((call) => String(call[0]))
       .filter((url) => url.includes('token-1'));
     expect(deltaCalls.length).toBe(1);
+  });
+
+  it('resumes a budget-limited cold run on the next run instead of restarting', async () => {
+    env.MS365_MCP_INDEX_MAX_ITEMS_PER_RUN = '2';
+    for (let i = 1; i <= 40; i += 1) {
+      const id = `bulk-${String(i).padStart(2, '0')}`;
+      files.set(id, {
+        id,
+        name: `${id}.txt`,
+        mime: 'text/plain',
+        bytes: Buffer.from(`Alpha indhold nummer ${i}`, 'utf8'),
+      });
+      extraItems.push(deltaFile(id, `${id}.txt`, 'text/plain'));
+    }
+    await initSearchIndex(deps, env);
+
+    // Cold budget: 2 * COLD_RUN_MULTIPLIER = 20 work items. The folder, the
+    // notes file and the unsupported legacy file count as work; the phantom
+    // deletion and the re-walked unchanged prefix do not.
+    const first = await refreshSearchIndex(deps, {});
+    expect(first.drives[0].moreRemaining).toBe(true);
+    expect(first.drives[0].seen).toBe(21);
+    expect(first.drives[0].folders).toBe(1);
+    expect(first.drives[0].indexed).toBe(18);
+    expect(first.drives[0].skipped).toBe(1);
+    expect(first.drives[0].unchanged).toBe(1);
+
+    // The already-done prefix is free, so the second run advances into the
+    // rest of the feed instead of re-spending its budget on the same items.
+    const second = await refreshSearchIndex(deps, {});
+    expect(second.drives[0].moreRemaining).toBe(true);
+    expect(second.drives[0].indexed).toBe(20);
+    expect(second.drives[0].folders).toBe(0);
+    expect(second.drives[0].skipped).toBe(0);
+
+    const third = await refreshSearchIndex(deps, {});
+    expect(third.drives[0].moreRemaining).toBe(false);
+    expect(third.drives[0].indexed).toBe(3);
+
+    const status = searchIndexStatus(env);
+    expect(status.documents).toBe(41);
+    expect(status.driveStates[0]?.hasDeltaToken).toBe(true);
+
+    // The feed now fits the warm delta budget and reports only unchanged items.
+    const fourth = await refreshSearchIndex(deps, {});
+    expect(fourth.drives[0].indexed).toBe(0);
+    expect(fourth.drives[0].unchanged).toBe(44);
   });
 
   it('counts without writing on dryRun', async () => {
