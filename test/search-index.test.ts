@@ -567,6 +567,9 @@ describe.skipIf(!sqliteAvailable)('index runtime with fake Graph and embeddings'
     id: 'folder-general',
     name: 'General',
     folder: {},
+    // Graph always sends a folder's lastModifiedDateTime; it changes whenever a
+    // child changes, so folder records must not compare it.
+    lastModifiedDateTime: '2026-10-10T10:00:00Z',
     parentReference: { id: 'root-1', driveId },
   };
 
@@ -696,6 +699,61 @@ describe.skipIf(!sqliteAvailable)('index runtime with fake Graph and embeddings'
     const fourth = await refreshSearchIndex(deps, {});
     expect(fourth.drives[0].indexed).toBe(0);
     expect(fourth.drives[0].unchanged).toBe(44);
+  });
+
+  it('converges on a feed of folders, unsupported files and a persistent error', async () => {
+    // Cold budget is 2 * 10 work items. The folders plus unsupported files alone
+    // reach that budget, so without free re-walks this feed would never finish.
+    env.MS365_MCP_INDEX_MAX_ITEMS_PER_RUN = '2';
+    for (let i = 1; i <= 12; i += 1) {
+      extraItems.push({
+        id: `folder-${i}`,
+        name: `Folder ${i}`,
+        folder: {},
+        lastModifiedDateTime: '2026-10-10T10:00:00Z',
+        parentReference: { id: 'root-1', driveId },
+      });
+    }
+    for (let i = 1; i <= 6; i += 1) {
+      extraItems.push(deltaFile(`legacy-${i}`, `legacy-${i}.xls`, 'application/vnd.ms-excel'));
+    }
+    for (let i = 1; i <= 10; i += 1) {
+      const id = `doc-${i}`;
+      files.set(id, {
+        id,
+        name: `${id}.txt`,
+        mime: 'text/plain',
+        bytes: Buffer.from(`Alpha tekst nummer ${i}`, 'utf8'),
+      });
+      extraItems.push(deltaFile(id, `${id}.txt`, 'text/plain'));
+    }
+    // No bytes for this one: the download fails on every run.
+    extraItems.push(deltaFile('doc-broken', 'broken.txt', 'text/plain'));
+    await initSearchIndex(deps, env);
+
+    // Cold budget is 3 * 10 work items. Folders and unsupported files must stop
+    // counting once stored, so every run spends its budget on new documents.
+    let runs = 0;
+    let summary = await refreshSearchIndex(deps, {});
+    runs += 1;
+    while (summary.drives[0].moreRemaining && runs < 20) {
+      summary = await refreshSearchIndex(deps, {});
+      runs += 1;
+    }
+    expect(summary.drives[0].moreRemaining).toBe(false);
+    expect(runs).toBeLessThanOrEqual(6);
+    expect(searchIndexStatus(env).documents).toBe(11);
+    expect(searchIndexStatus(env).driveStates[0]?.hasDeltaToken).toBe(true);
+
+    // A warm run walks the whole feed for free: folders, unsupported files and
+    // the unchanged error are all unchanged, and nothing is downloaded again.
+    const warm = await refreshSearchIndex(deps, {});
+    expect(warm.drives[0].moreRemaining).toBe(false);
+    expect(warm.drives[0].folders).toBe(0);
+    expect(warm.drives[0].skipped).toBe(0);
+    expect(warm.drives[0].indexed).toBe(0);
+    expect(warm.drives[0].errors).toBe(1);
+    expect(warm.drives[0].unchanged).toBeGreaterThanOrEqual(31);
   });
 
   it('counts without writing on dryRun and walks past the item budget', async () => {

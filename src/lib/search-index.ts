@@ -449,7 +449,15 @@ async function applyDeltaItem(
   const metadata = deltaItemMetadata(item);
   if (item.folder !== undefined) {
     const existing = active.store.getItem(itemId);
-    if (existing && existing.state === 'folder' && isUnchanged(existing, metadata)) {
+    // A folder's own record only carries its name and parent, so compare those:
+    // lastModifiedDateTime changes whenever a child changes and would otherwise
+    // keep every folder counting as work on every walk.
+    if (
+      existing &&
+      existing.state === 'folder' &&
+      existing.name === metadata.name &&
+      existing.parentId === metadata.parentId
+    ) {
       summary.unchanged += 1;
       return;
     }
@@ -486,8 +494,16 @@ async function applyDeltaItem(
     return;
   }
 
-  if (!metadata.kind) {
-    if (isSkippedUnchanged(active.store.getItem(itemId), metadata, 'unsupported')) {
+  const existing = active.store.getItem(itemId);
+  const unchanged = existing !== undefined && isUnchanged(existing, metadata);
+  const kind = metadata.kind;
+  if (!kind) {
+    if (
+      existing &&
+      existing.state === 'skipped' &&
+      existing.skipReason === 'unsupported' &&
+      unchanged
+    ) {
       summary.unchanged += 1;
       return;
     }
@@ -508,7 +524,12 @@ async function applyDeltaItem(
     return;
   }
   if (metadata.size !== undefined && metadata.size > active.config.maxFileBytes) {
-    if (isSkippedUnchanged(active.store.getItem(itemId), metadata, 'too_large')) {
+    if (
+      existing &&
+      existing.state === 'skipped' &&
+      existing.skipReason === 'too_large' &&
+      unchanged
+    ) {
       summary.unchanged += 1;
       return;
     }
@@ -529,8 +550,16 @@ async function applyDeltaItem(
     return;
   }
 
-  const existing = active.store.getItem(itemId);
-  if (existing && existing.state === 'indexed' && isUnchanged(existing, metadata)) {
+  // An unchanged file needs no work: an indexed one is current, an empty
+  // extraction would only download the same bytes for the same empty result,
+  // and an errored one gets its own retry pass before the walk.
+  if (
+    existing &&
+    unchanged &&
+    (existing.state === 'indexed' ||
+      existing.state === 'error' ||
+      (existing.state === 'skipped' && existing.skipReason === 'empty'))
+  ) {
     summary.unchanged += 1;
     return;
   }
@@ -547,7 +576,7 @@ async function applyDeltaItem(
     mime: metadata.mime,
     quickxor: metadata.quickxor,
   };
-  const outcome = await indexItemContent(deps, active, input, metadata.kind, accessToken);
+  const outcome = await indexItemContent(deps, active, input, kind, accessToken);
   if (outcome === 'indexed') summary.indexed += 1;
   else if (outcome === 'skipped') summary.skipped += 1;
   else summary.errors += 1;
