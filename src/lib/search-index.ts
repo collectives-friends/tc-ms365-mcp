@@ -29,6 +29,7 @@ import {
 import { EmbedClient } from './search-index-embed.js';
 import {
   openSearchIndexStore,
+  type DriveRunRecord,
   type ItemRecord,
   type SearchChunkRow,
   type SearchIndexStore,
@@ -268,6 +269,32 @@ function deferredSummary(driveId: string): DriveSyncSummary {
   return { ...emptySummary(driveId), status: 'deferred', moreRemaining: true };
 }
 
+/**
+ * Remember the run's counts so `search-index-status` can show them without a
+ * sync call (agents often cannot wait for one: the client timeout is shorter
+ * than a productive run). Bookkeeping only: never fail the sync over it.
+ */
+function persistRunRecord(active: SearchIndexRuntime, summary: DriveSyncSummary): void {
+  const record: DriveRunRecord = {
+    at: new Date().toISOString(),
+    status: summary.status,
+    seen: summary.seen,
+    folders: summary.folders,
+    indexed: summary.indexed,
+    unchanged: summary.unchanged,
+    skipped: summary.skipped,
+    deleted: summary.deleted,
+    errors: summary.errors,
+    moreRemaining: summary.moreRemaining,
+    elapsedMs: summary.elapsedMs,
+  };
+  try {
+    active.store.saveDriveRunSummary(summary.driveId, record);
+  } catch (error) {
+    logger.warn(`[SEARCH INDEX] could not record run summary: ${shortError(error)}`);
+  }
+}
+
 // Only genuine work (new or changed entries) counts against the run's item
 // budget. Re-walked unchanged entries are free, so a run that stops at the
 // budget still makes real progress on the next run, even without a stored
@@ -361,6 +388,7 @@ async function syncDrive(
   }
   summary.elapsedMs = Date.now() - started;
   if (options.dryRun) summary.survey = survey;
+  if (!options.dryRun) persistRunRecord(active, summary);
   return summary;
 }
 
@@ -697,6 +725,7 @@ async function indexItemContent(
       const bytes = await readBytesWithCap(stream.body, active.config.maxFileBytes);
       const text = await extractDocumentText(bytes, kind, {
         maxChars: active.config.maxCharsPerDoc,
+        maxPartBytes: active.config.maxPartBytes,
       });
       const capped = text.slice(0, active.config.maxCharsPerDoc);
       if (!capped.trim()) {
@@ -1053,6 +1082,7 @@ export interface SearchIndexStatus {
     driveId: string;
     lastRunAt?: string;
     lastStatus?: string;
+    lastRun?: DriveRunRecord;
     hasDeltaToken: boolean;
   }>;
   dbBytes?: number;
@@ -1092,6 +1122,7 @@ export function searchIndexStatus(env: Env = process.env): SearchIndexStatus {
       driveId: state.driveId,
       lastRunAt: state.lastRunAt,
       lastStatus: state.lastStatus,
+      lastRun: state.lastRunSummary,
       hasDeltaToken: Boolean(state.deltaLink),
     })),
     dbBytes: fileSize(active.store.dbPath),

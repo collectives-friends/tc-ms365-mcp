@@ -2189,7 +2189,7 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
     searchKeywords:
       'refresh search index update search index sync search index reindex rebuild index index documents',
     description:
-      'Bring the semantic search index up to date from Microsoft Graph. Read-only on the Microsoft side: it downloads document content and writes the local index only. Without arguments it applies the deltas since the last run for every configured drive; full: true rebuilds a drive from scratch; dryRun: true only counts what would be indexed (files by type and bytes) without downloading or writing anything — it walks the whole drive in one call and is bounded by maxMinutes, not by the item budget. Returns per-drive counts (seen, folders, indexed, unchanged, skipped, deleted, errors) and moreRemaining, which is true when a run stopped at its budget (run again to continue).',
+      'Bring the semantic search index up to date from Microsoft Graph. Read-only on the Microsoft side: it downloads document content and writes the local index only. Without arguments it applies the deltas since the last run for every configured drive; full: true rebuilds a drive from scratch; dryRun: true only counts what would be indexed (files by type and bytes) without downloading or writing anything — it walks the whole drive in one call and is bounded by maxMinutes, not by the item budget. Returns per-drive counts (seen, folders, indexed, unchanged, skipped, deleted, errors) and moreRemaining, which is true when a run stopped at its budget (run again to continue). maxMinutes is a soft budget checked between items, so one large document can overshoot it; a call with real work can therefore exceed the MCP client timeout while the run continues and finishes on the server, and search-index-status reports the counts of that run afterwards in lastRun.',
     readOnlyHint: false,
     openWorldHint: true,
     buildSchema: () => ({
@@ -2248,7 +2248,7 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
     searchKeywords:
       'search index status index coverage documents indexed chunks last sync vector backend embedding model',
     description:
-      'Report the state of the semantic search index: whether it is enabled and ready, the vector backend (sqlite-vec or FTS5-only), the embedding model and dimensions, per-drive document/chunk/error counts, the last run time and status per drive, and the index file size. Use it to check coverage before or after refresh-search-index.',
+      'Report the state of the semantic search index: whether it is enabled and ready, the vector backend (sqlite-vec or FTS5-only), the embedding model and dimensions, per-drive document/chunk/error counts, the last run time and status per drive, the last run counts per drive (lastRun: seen/folders/indexed/unchanged/skipped/deleted/errors/moreRemaining/elapsedMs) and the index file size. Use it to check coverage before or after refresh-search-index; lastRun also shows the numbers of a sync call that timed out on the client.',
     readOnlyHint: true,
     openWorldHint: false,
     buildSchema: () => ({}),

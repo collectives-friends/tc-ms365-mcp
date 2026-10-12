@@ -8,6 +8,7 @@
  */
 
 import { MAX_DOCUMENT_BYTES } from './document-text.js';
+import { MAX_UNCOMPRESSED_PART_BYTES } from './ooxml-text.js';
 import {
   DEFAULT_EMBED_DIMS,
   DEFAULT_EMBED_MODEL,
@@ -30,6 +31,7 @@ export interface SearchIndexConfig {
   maxItemsPerRun: number;
   maxCharsPerDoc: number;
   maxFileBytes: number;
+  maxPartBytes: number;
   embedModel: string;
   embedDims: number;
   openaiApiKey?: string;
@@ -74,6 +76,12 @@ export function loadSearchIndexConfig(env: Env = process.env): SearchIndexConfig
       MAX_DOCUMENT_BYTES,
       1024,
       200 * 1024 * 1024
+    ),
+    maxPartBytes: intFromEnv(
+      env.MS365_MCP_INDEX_MAX_PART_BYTES,
+      MAX_UNCOMPRESSED_PART_BYTES,
+      1024 * 1024,
+      256 * 1024 * 1024
     ),
     embedModel: env.OPENAI_EMBED_MODEL?.trim() || DEFAULT_EMBED_MODEL,
     embedDims: intFromEnv(env.OPENAI_EMBED_DIMS, DEFAULT_EMBED_DIMS, 64, 3072),

@@ -132,13 +132,14 @@ async function loadUnpdf(): Promise<UnpdfModule> {
 
 /**
  * Extract the full plain text of `bytes`, at most `maxChars` characters.
+ * `maxPartBytes` overrides the OOXML part bound for docx/xlsx/pptx packages.
  * Throws with a user-presentable message for corrupt, encrypted or otherwise
  * unreadable documents.
  */
 export async function extractDocumentText(
   bytes: Buffer,
   kind: DocumentKind,
-  options: { maxChars?: number } = {}
+  options: { maxChars?: number; maxPartBytes?: number } = {}
 ): Promise<string> {
   const maxChars = options.maxChars ?? EXTRACTION_MAX_CHARS;
   if (bytes.length === 0) {
@@ -149,14 +150,16 @@ export async function extractDocumentText(
   }
   if (kind === 'docx') {
     const ooxml = await import('./ooxml-text.js');
-    await ooxml.assertDocxWithinPartBound(bytes);
+    await ooxml.assertDocxWithinPartBound(bytes, options.maxPartBytes);
     const mammoth = await loadMammoth();
     const result = await mammoth.extractRawText({ buffer: bytes });
     return result.value.slice(0, maxChars);
   }
   if (kind === 'xlsx' || kind === 'pptx') {
     const ooxml = await import('./ooxml-text.js');
-    return kind === 'xlsx' ? ooxml.extractXlsxText(bytes) : ooxml.extractPptxText(bytes);
+    return kind === 'xlsx'
+      ? ooxml.extractXlsxText(bytes, options.maxPartBytes)
+      : ooxml.extractPptxText(bytes, options.maxPartBytes);
   }
   // Pass a view instead of copying the Buffer's bytes into a new Uint8Array.
   const data = new Uint8Array(bytes.buffer as ArrayBuffer, bytes.byteOffset, bytes.byteLength);

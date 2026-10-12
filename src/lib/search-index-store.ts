@@ -87,11 +87,41 @@ async function tryLoadVectorExtension(db: SqliteDatabase): Promise<boolean> {
   }
 }
 
+/** Parse a persisted run record; malformed rows fall back to "no record". */
+function parseRunRecord(value: unknown): DriveRunRecord | undefined {
+  if (value === null || value === undefined) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(String(value));
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed as DriveRunRecord;
+    }
+  } catch {
+    // Ignore malformed bookkeeping; the rest of the status call still works.
+  }
+  return undefined;
+}
+
+/** Counts persisted for one drive after a sync run, shown by `search-index-status`. */
+export interface DriveRunRecord {
+  at: string;
+  status: string;
+  seen: number;
+  folders: number;
+  indexed: number;
+  unchanged: number;
+  skipped: number;
+  deleted: number;
+  errors: number;
+  moreRemaining: boolean;
+  elapsedMs: number;
+}
+
 export interface DriveState {
   driveId: string;
   deltaLink?: string;
   lastRunAt?: string;
   lastStatus?: string;
+  lastRunSummary?: DriveRunRecord;
 }
 
 export interface ItemRecord {
@@ -235,8 +265,18 @@ export class SearchIndexStore {
 
     this.db.exec(
       'CREATE TABLE IF NOT EXISTS drives (' +
-        'drive_id TEXT PRIMARY KEY, delta_link TEXT, last_run_at TEXT, last_status TEXT)'
+        'drive_id TEXT PRIMARY KEY, delta_link TEXT, last_run_at TEXT, last_status TEXT, ' +
+        'last_run_summary TEXT)'
     );
+    // Additive migration for databases created before last_run_summary existed
+    // (the column is bookkeeping only, so the index itself stays intact).
+    const driveColumns = this.db
+      .prepare('PRAGMA table_info(drives)')
+      .all()
+      .map((row) => String(row.name));
+    if (!driveColumns.includes('last_run_summary')) {
+      this.db.exec('ALTER TABLE drives ADD COLUMN last_run_summary TEXT');
+    }
     this.db.exec(
       'CREATE TABLE IF NOT EXISTS items (' +
         'item_id TEXT PRIMARY KEY, drive_id TEXT NOT NULL, parent_id TEXT, name TEXT, path TEXT, ' +
@@ -297,7 +337,7 @@ export class SearchIndexStore {
   getDriveState(driveId: string): DriveState | undefined {
     const row = this.db
       .prepare(
-        'SELECT drive_id, delta_link, last_run_at, last_status FROM drives WHERE drive_id = ?'
+        'SELECT drive_id, delta_link, last_run_at, last_status, last_run_summary FROM drives WHERE drive_id = ?'
       )
       .get(driveId);
     if (!row) return undefined;
@@ -306,13 +346,14 @@ export class SearchIndexStore {
       deltaLink: toText(row.delta_link),
       lastRunAt: toText(row.last_run_at),
       lastStatus: toText(row.last_status),
+      lastRunSummary: parseRunRecord(row.last_run_summary),
     };
   }
 
   listDriveStates(): DriveState[] {
     return this.db
       .prepare(
-        'SELECT drive_id, delta_link, last_run_at, last_status FROM drives ORDER BY drive_id'
+        'SELECT drive_id, delta_link, last_run_at, last_status, last_run_summary FROM drives ORDER BY drive_id'
       )
       .all()
       .map((row) => ({
@@ -320,6 +361,7 @@ export class SearchIndexStore {
         deltaLink: toText(row.delta_link),
         lastRunAt: toText(row.last_run_at),
         lastStatus: toText(row.last_status),
+        lastRunSummary: parseRunRecord(row.last_run_summary),
       }));
   }
 
@@ -341,6 +383,19 @@ export class SearchIndexStore {
           'last_status = excluded.last_status'
       )
       .run(driveId, new Date().toISOString(), status);
+  }
+
+  /**
+   * Persist the counts of the drive's most recent sync run so a status call can
+   * show them even when the sync call itself timed out on the client.
+   */
+  saveDriveRunSummary(driveId: string, record: DriveRunRecord): void {
+    this.db
+      .prepare(
+        'INSERT INTO drives (drive_id, last_run_summary) VALUES (?, ?) ' +
+          'ON CONFLICT(drive_id) DO UPDATE SET last_run_summary = excluded.last_run_summary'
+      )
+      .run(driveId, JSON.stringify(record));
   }
 
   /** Drop every derived row for one drive (full re-index path). */

@@ -18,10 +18,12 @@
 
 export const OOXML_MAX_TEXT_CHARS = 2_000_000;
 /**
- * Upper bound on one decompressed package part. The XML DOM for a part costs
- * many times the part's own bytes, so a part beyond this bound would risk the
- * whole process instead of one document; such packages are reported as
- * unreadable rather than parsed.
+ * Default upper bound on one decompressed package part. The XML DOM for a part
+ * costs many times the part's own bytes, so a part beyond this bound would risk
+ * the whole process instead of one document; such packages are reported as
+ * unreadable rather than parsed. Callers may raise or lower the bound (the
+ * search index passes MS365_MCP_INDEX_MAX_PART_BYTES) when the deployment
+ * accepts the larger memory cost.
  */
 export const MAX_UNCOMPRESSED_PART_BYTES = 32 * 1024 * 1024;
 
@@ -88,11 +90,15 @@ async function openZip(bytes: Buffer, label: string): Promise<ZipArchive> {
   }
 }
 
-async function readPart(zip: ZipArchive, partPath: string): Promise<string | undefined> {
+async function readPart(
+  zip: ZipArchive,
+  partPath: string,
+  maxPartBytes: number = MAX_UNCOMPRESSED_PART_BYTES
+): Promise<string | undefined> {
   const entry = zip.file(partPath);
   if (!entry) return undefined;
   const uncompressedSize = entry._data?.uncompressedSize;
-  if (typeof uncompressedSize === 'number' && uncompressedSize > MAX_UNCOMPRESSED_PART_BYTES) {
+  if (typeof uncompressedSize === 'number' && uncompressedSize > maxPartBytes) {
     throw new Error('The document is too large to extract safely.');
   }
   return entry.async('string');
@@ -103,7 +109,10 @@ async function readPart(zip: ZipArchive, partPath: string): Promise<string | und
  * part bound before mammoth parses it. An unreadable package passes through:
  * mammoth then reports the real read error.
  */
-export async function assertDocxWithinPartBound(bytes: Buffer): Promise<void> {
+export async function assertDocxWithinPartBound(
+  bytes: Buffer,
+  maxPartBytes: number = MAX_UNCOMPRESSED_PART_BYTES
+): Promise<void> {
   let uncompressedSize: number | undefined;
   try {
     const zip = await openZip(bytes, 'document');
@@ -111,7 +120,7 @@ export async function assertDocxWithinPartBound(bytes: Buffer): Promise<void> {
   } catch {
     return;
   }
-  if (typeof uncompressedSize === 'number' && uncompressedSize > MAX_UNCOMPRESSED_PART_BYTES) {
+  if (typeof uncompressedSize === 'number' && uncompressedSize > maxPartBytes) {
     throw new Error('The document is too large to extract safely.');
   }
 }
@@ -165,8 +174,12 @@ interface Relationship {
   type: string;
 }
 
-async function readRelationships(zip: ZipArchive, relsPath: string): Promise<Relationship[]> {
-  const xml = await readPart(zip, relsPath);
+async function readRelationships(
+  zip: ZipArchive,
+  relsPath: string,
+  maxPartBytes: number = MAX_UNCOMPRESSED_PART_BYTES
+): Promise<Relationship[]> {
+  const xml = await readPart(zip, relsPath, maxPartBytes);
   if (!xml) return [];
   const relationships: Relationship[] = [];
   for (const rel of descendants(await parseXml(xml), 'Relationship')) {
@@ -217,14 +230,17 @@ function appendSection(sections: string[], text: string, total: { value: number 
 
 // -- XLSX -------------------------------------------------------------------
 
-export async function extractXlsxText(bytes: Buffer): Promise<string> {
+export async function extractXlsxText(
+  bytes: Buffer,
+  maxPartBytes: number = MAX_UNCOMPRESSED_PART_BYTES
+): Promise<string> {
   const zip = await openZip(bytes, 'spreadsheet');
-  const workbookXml = await readPart(zip, 'xl/workbook.xml');
+  const workbookXml = await readPart(zip, 'xl/workbook.xml', maxPartBytes);
   if (!workbookXml) {
     throw new Error('The spreadsheet package has no workbook part.');
   }
-  const workbookRels = await readRelationships(zip, 'xl/_rels/workbook.xml.rels');
-  const sharedStrings = await readSharedStrings(zip);
+  const workbookRels = await readRelationships(zip, 'xl/_rels/workbook.xml.rels', maxPartBytes);
+  const sharedStrings = await readSharedStrings(zip, maxPartBytes);
 
   const sections: string[] = [];
   const total = { value: 0 };
@@ -234,7 +250,7 @@ export async function extractXlsxText(bytes: Buffer): Promise<string> {
     const relId = relationshipAttribute(sheet, 'id');
     const target = relId ? workbookRels.find((rel) => rel.id === relId)?.target : undefined;
     const partPath = target ? resolvePart('xl/workbook.xml', target) : undefined;
-    const partXml = partPath ? await readPart(zip, partPath) : undefined;
+    const partXml = partPath ? await readPart(zip, partPath, maxPartBytes) : undefined;
     if (!partXml) continue;
     const lines = sheetTextLines(await parseXml(partXml), sharedStrings);
     if (lines.length === 0) continue;
@@ -243,8 +259,11 @@ export async function extractXlsxText(bytes: Buffer): Promise<string> {
   return sections.join('\n\n');
 }
 
-async function readSharedStrings(zip: ZipArchive): Promise<string[]> {
-  const xml = await readPart(zip, 'xl/sharedStrings.xml');
+async function readSharedStrings(
+  zip: ZipArchive,
+  maxPartBytes: number = MAX_UNCOMPRESSED_PART_BYTES
+): Promise<string[]> {
+  const xml = await readPart(zip, 'xl/sharedStrings.xml', maxPartBytes);
   if (!xml) return [];
   const root = await parseXml(xml);
   return descendants(root, 'si').map((item) =>
@@ -328,10 +347,17 @@ function cellText(cell: XmlNode, sharedStrings: string[]): string {
 
 // -- PPTX -------------------------------------------------------------------
 
-export async function extractPptxText(bytes: Buffer): Promise<string> {
+export async function extractPptxText(
+  bytes: Buffer,
+  maxPartBytes: number = MAX_UNCOMPRESSED_PART_BYTES
+): Promise<string> {
   const zip = await openZip(bytes, 'presentation');
-  const presentationXml = await readPart(zip, 'ppt/presentation.xml');
-  const presentationRels = await readRelationships(zip, 'ppt/_rels/presentation.xml.rels');
+  const presentationXml = await readPart(zip, 'ppt/presentation.xml', maxPartBytes);
+  const presentationRels = await readRelationships(
+    zip,
+    'ppt/_rels/presentation.xml.rels',
+    maxPartBytes
+  );
 
   let slideParts: string[] = [];
   if (presentationXml) {
@@ -353,11 +379,11 @@ export async function extractPptxText(bytes: Buffer): Promise<string> {
   const total = { value: 0 };
   for (let index = 0; index < slideParts.length; index++) {
     if (total.value >= OOXML_MAX_TEXT_CHARS) break;
-    const slideXml = await readPart(zip, slideParts[index]);
+    const slideXml = await readPart(zip, slideParts[index], maxPartBytes);
     if (!slideXml) continue;
     const body = flattenDrawingText(await parseXml(slideXml));
-    const notesPart = await notesPartFor(zip, slideParts[index]);
-    const notesXml = notesPart ? await readPart(zip, notesPart) : undefined;
+    const notesPart = await notesPartFor(zip, slideParts[index], maxPartBytes);
+    const notesXml = notesPart ? await readPart(zip, notesPart, maxPartBytes) : undefined;
     const notes = notesXml ? flattenDrawingText(await parseXml(notesXml)) : '';
     if (!body && !notes) continue;
     const parts = [`[Slide ${index + 1}]`];
@@ -374,10 +400,14 @@ function slideOrdinal(path: string): number {
 }
 
 /** The notes slide attached to a slide, resolved through the slide's own rels. */
-async function notesPartFor(zip: ZipArchive, slidePath: string): Promise<string | undefined> {
+async function notesPartFor(
+  zip: ZipArchive,
+  slidePath: string,
+  maxPartBytes: number = MAX_UNCOMPRESSED_PART_BYTES
+): Promise<string | undefined> {
   const directory = slidePath.slice(0, slidePath.lastIndexOf('/') + 1);
   const fileName = slidePath.slice(slidePath.lastIndexOf('/') + 1);
-  const rels = await readRelationships(zip, `${directory}_rels/${fileName}.rels`);
+  const rels = await readRelationships(zip, `${directory}_rels/${fileName}.rels`, maxPartBytes);
   const notes = rels.find((rel) => rel.type.endsWith('/notesSlide'));
   return notes ? resolvePart(slidePath, notes.target) : undefined;
 }

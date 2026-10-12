@@ -297,6 +297,19 @@ describe('document kinds and OOXML extraction', () => {
     const bytes = await zip.generateAsync({ type: 'nodebuffer' });
     await expect(extractDocumentText(bytes, 'docx')).rejects.toThrow(/too large/i);
   });
+
+  it('honours a caller-supplied OOXML part bound', async () => {
+    const zip = new JSZip();
+    zip.file(
+      'ppt/slides/slide1.xml',
+      `<?xml version="1.0"?><p:sld><a:t>${'x'.repeat(2000)}</a:t></p:sld>`
+    );
+    const bytes = await zip.generateAsync({ type: 'nodebuffer' });
+    await expect(extractDocumentText(bytes, 'pptx', { maxPartBytes: 512 })).rejects.toThrow(
+      /too large/i
+    );
+    await expect(extractDocumentText(bytes, 'pptx')).resolves.toContain('x');
+  });
 });
 
 describe('chunkText', () => {
@@ -470,6 +483,17 @@ describe('search index config', () => {
     expect(validateSearchIndexConfig(valid)).toBeUndefined();
     expect(valid.driveIds).toEqual(['drv-1', 'drv-2']);
   });
+
+  it('reads the OOXML part bound with a default and a clamped override', () => {
+    expect(loadSearchIndexConfig({}).maxPartBytes).toBe(MAX_UNCOMPRESSED_PART_BYTES);
+    expect(loadSearchIndexConfig({ MS365_MCP_INDEX_MAX_PART_BYTES: '1048576' }).maxPartBytes).toBe(
+      1024 * 1024
+    );
+    // Below the minimum the value clamps to 1 MiB.
+    expect(loadSearchIndexConfig({ MS365_MCP_INDEX_MAX_PART_BYTES: '1024' }).maxPartBytes).toBe(
+      1024 * 1024
+    );
+  });
 });
 
 describe.skipIf(!sqliteAvailable)('search index store', () => {
@@ -567,6 +591,22 @@ describe.skipIf(!sqliteAvailable)('search index store', () => {
       'https://graph.microsoft.com/v1.0/drives/drv-1/root/delta?token=1'
     );
     expect(store.getDriveState('drv-1')?.deltaLink).toContain('token=1');
+    store.saveDriveRunSummary('drv-1', {
+      at: '2026-10-12T12:00:00Z',
+      status: 'ok',
+      seen: 5,
+      folders: 1,
+      indexed: 3,
+      unchanged: 1,
+      skipped: 0,
+      deleted: 0,
+      errors: 0,
+      moreRemaining: false,
+      elapsedMs: 4321,
+    });
+    const runRecord = store.getDriveState('drv-1')?.lastRunSummary;
+    expect(runRecord?.indexed).toBe(3);
+    expect(runRecord?.elapsedMs).toBe(4321);
     store.upsertItem({ ...record, state: 'error', skipReason: 'boom' });
     const errored = store.itemsByState('drv-1', 'error', 10);
     expect(errored).toHaveLength(1);
@@ -654,6 +694,8 @@ describe.skipIf(!sqliteAvailable)('index runtime with fake Graph and embeddings'
     expect(status.documents).toBe(1);
     expect(status.chunks).toBeGreaterThan(0);
     expect(status.driveStates[0]?.hasDeltaToken).toBe(true);
+    expect(status.driveStates[0]?.lastRun?.indexed).toBe(1);
+    expect(status.driveStates[0]?.lastRun?.moreRemaining).toBe(false);
     expect(status.dbBytes).toBeGreaterThan(0);
 
     const search = await semanticSearch({ query: 'Alpha', topK: 5 });
