@@ -33,6 +33,7 @@ import {
   toOAuthErrorResponse,
 } from './lib/microsoft-auth.js';
 import { isAllowedRedirectUri, parseAllowlist } from './lib/redirect-uri-validation.js';
+import { initSearchIndex } from './lib/search-index.js';
 import logger, { enableConsoleLogging } from './logger.js';
 import { buildMcpServerInstructions } from './mcp-instructions.js';
 import { installToolSchemaRefNormalization } from './normalize-tool-schema.js';
@@ -1227,6 +1228,19 @@ class MicrosoftGraphServer {
       logger.info(
         `  - OAuth discovery: http://${mcp.authority}/.well-known/oauth-authorization-server`
       );
+
+      // Semantic search index (MS365_MCP_INDEX_ENABLED): build the SQLite
+      // store and start the scheduled delta worker. Init runs in the
+      // background and its failure is logged, not fatal -- the index tools
+      // then report the reason instead of taking the MCP listener down with
+      // them.
+      if (this.graphClient) {
+        void initSearchIndex({ graph: this.graphClient, auth: this.authManager }).catch((error) => {
+          logger.warn(
+            `[SEARCH INDEX] init failed: ${error instanceof Error ? error.message : String(error)}`
+          );
+        });
+      }
 
       if (attachmentApp && attachmentPort !== null) {
         // Inherits the MCP listener's host unless --attachment-host overrides it.

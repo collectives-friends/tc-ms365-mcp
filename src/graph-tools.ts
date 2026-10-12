@@ -17,6 +17,7 @@ import {
   normalizeMimeType,
   pageDocumentText,
 } from './lib/document-text.js';
+import { refreshSearchIndex, searchIndexStatus, semanticSearch } from './lib/search-index.js';
 import { auditLog, getUserIdentityForAudit, type AuditEvent } from './audit-log.js';
 import { deriveTargetResource, type AuditTargetResource } from './audit-target-resource.js';
 import AuthManager, {
@@ -1926,7 +1927,7 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
     searchKeywords:
       'read document read word document read pdf document docx document extract document text document contents document summarize document quote document cite document read report read contract read invoice text extraction',
     description:
-      'Extract the plain text of a Word (.docx, .docm), PDF or plain-text document from OneDrive or SharePoint. Returns { kind, charCount, offset, maxChars, returnedChars, truncated, nextOffset?, text, name?, webUrl?, mimeType?, size? }; webUrl is the browser link for citing the source document. Long documents are paged: the response carries at most maxChars characters from offset and sets truncated plus nextOffset, so the next call continues where this one stopped. Scanned PDFs without a text layer return empty text plus a note; this tool does not OCR, and it does not read PowerPoint or legacy .doc files.',
+      'Extract the plain text of a Word (.docx, .docm), Excel (.xlsx, .xlsm), PowerPoint (.pptx, .pptm), PDF or plain-text document from OneDrive or SharePoint. Returns { kind, charCount, offset, maxChars, returnedChars, truncated, nextOffset?, text, name?, webUrl?, mimeType?, size? }; webUrl is the browser link for citing the source document. Long documents are paged: the response carries at most maxChars characters from offset and sets truncated plus nextOffset, so the next call continues where this one stopped. Spreadsheet text is sheet by sheet with tab-separated rows (cell values, not formulas); presentation text is slide by slide including speaker notes. Scanned PDFs without a text layer return empty text plus a note; this tool does not OCR and does not read legacy binary .doc/.xls/.ppt files.',
     readOnlyHint: true,
     openWorldHint: true,
     buildSchema: (ctx) => {
@@ -2095,6 +2096,158 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
           content: [{ type: 'text', text: JSON.stringify({ error: (error as Error).message }) }],
           isError: true,
           ...(Object.keys(auditFields).length > 0 ? { _meta: auditFields } : {}),
+        };
+      }
+    },
+  },
+  {
+    name: 'semantic-search',
+    method: 'GET',
+    path: 'tool:semantic-search',
+    searchKeywords:
+      'semantic search meaning based search find document by topic natural language search knowledge index similarity search document search',
+    description:
+      'Search the indexed content of the shared SharePoint drive(s) by meaning rather than by file name: use it when the user describes a document by topic ("the supplier contract about hosting", "budget for next year") instead of naming the file. Returns ranked hits with { name, webUrl, path, driveId, lastModified, mime, size, score, snippet }; snippet is a short excerpt of the matched text and webUrl is the browser link for citing the document. Follow up with extract-document-text on a hit to read the full document. The index covers Word, Excel, PowerPoint, PDF and plain-text documents and the server refreshes it every few minutes; refresh-search-index updates it immediately.',
+    readOnlyHint: true,
+    openWorldHint: true,
+    buildSchema: () => ({
+      query: z
+        .string()
+        .min(1)
+        .describe(
+          'Natural-language description of what to find (a topic, a phrase, or a question).'
+        ),
+      driveId: z
+        .string()
+        .optional()
+        .describe('Limit the search to one indexed drive id; defaults to every indexed drive.'),
+      pathPrefix: z
+        .string()
+        .optional()
+        .describe('Limit to documents whose path starts with this prefix, e.g. "/Regnskab".'),
+      topK: z
+        .number()
+        .int()
+        .min(1)
+        .max(25)
+        .optional()
+        .describe('Maximum number of documents to return (1-25, default 8).'),
+      hybrid: z
+        .boolean()
+        .optional()
+        .describe(
+          'Combine meaning and keyword ranking (default true). Set false to rank by meaning only.'
+        ),
+    }),
+    execute: async (params) => {
+      try {
+        const query = String(params.query ?? '').trim();
+        const result = await semanticSearch({
+          query,
+          driveId: typeof params.driveId === 'string' ? params.driveId : undefined,
+          pathPrefix: typeof params.pathPrefix === 'string' ? params.pathPrefix : undefined,
+          topK: typeof params.topK === 'number' ? params.topK : undefined,
+          hybrid: typeof params.hybrid === 'boolean' ? params.hybrid : undefined,
+        });
+        const payload = JSON.stringify({
+          query,
+          hitCount: result.hits.length,
+          ...(result.notes.length > 0 ? { notes: result.notes } : {}),
+          hits: result.hits,
+        });
+        return {
+          content: [{ type: 'text', text: payload }],
+          _meta: { response_bytes: Buffer.byteLength(payload) },
+        };
+      } catch (error) {
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ error: (error as Error).message }) }],
+          isError: true,
+        };
+      }
+    },
+  },
+  {
+    name: 'refresh-search-index',
+    method: 'POST',
+    path: 'tool:refresh-search-index',
+    searchKeywords:
+      'refresh search index update search index sync search index reindex rebuild index index documents',
+    description:
+      'Bring the semantic search index up to date from Microsoft Graph. Read-only on the Microsoft side: it downloads document content and writes the local index only. Without arguments it applies the deltas since the last run for every configured drive; full: true rebuilds a drive from scratch; dryRun: true only counts what would be indexed (files by type and bytes) without downloading or writing anything. Returns per-drive counts (seen, folders, indexed, unchanged, skipped, deleted, errors) and moreRemaining, which is true when a run stopped at its budget (run again to continue).',
+    readOnlyHint: false,
+    openWorldHint: true,
+    buildSchema: () => ({
+      driveId: z
+        .string()
+        .optional()
+        .describe('Sync only this configured drive id; defaults to every configured drive.'),
+      full: z
+        .boolean()
+        .optional()
+        .describe(
+          'Rebuild the drive index from scratch, dropping the stored items for the drive first. Default false.'
+        ),
+      dryRun: z
+        .boolean()
+        .optional()
+        .describe(
+          'Count what would be indexed without downloading files or writing to the index. Default false.'
+        ),
+      maxMinutes: z
+        .number()
+        .int()
+        .min(1)
+        .max(30)
+        .optional()
+        .describe('Time budget for this run in minutes (1-30, default 5).'),
+    }),
+    execute: async (params, { graphClient, authManager }) => {
+      try {
+        const result = await refreshSearchIndex(
+          { graph: graphClient, auth: authManager },
+          {
+            driveId: typeof params.driveId === 'string' ? params.driveId : undefined,
+            full: typeof params.full === 'boolean' ? params.full : undefined,
+            dryRun: typeof params.dryRun === 'boolean' ? params.dryRun : undefined,
+            maxMinutes: typeof params.maxMinutes === 'number' ? params.maxMinutes : undefined,
+          }
+        );
+        const payload = JSON.stringify(result);
+        return {
+          content: [{ type: 'text', text: payload }],
+          _meta: { response_bytes: Buffer.byteLength(payload) },
+        };
+      } catch (error) {
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ error: (error as Error).message }) }],
+          isError: true,
+        };
+      }
+    },
+  },
+  {
+    name: 'search-index-status',
+    method: 'GET',
+    path: 'tool:search-index-status',
+    searchKeywords:
+      'search index status index coverage documents indexed chunks last sync vector backend embedding model',
+    description:
+      'Report the state of the semantic search index: whether it is enabled and ready, the vector backend (sqlite-vec or FTS5-only), the embedding model and dimensions, per-drive document/chunk/error counts, the last run time and status per drive, and the index file size. Use it to check coverage before or after refresh-search-index.',
+    readOnlyHint: true,
+    openWorldHint: false,
+    buildSchema: () => ({}),
+    execute: async () => {
+      try {
+        const payload = JSON.stringify(searchIndexStatus());
+        return {
+          content: [{ type: 'text', text: payload }],
+          _meta: { response_bytes: Buffer.byteLength(payload) },
+        };
+      } catch (error) {
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ error: (error as Error).message }) }],
+          isError: true,
         };
       }
     },

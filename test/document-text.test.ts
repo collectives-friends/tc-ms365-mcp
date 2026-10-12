@@ -39,13 +39,9 @@ describe('detectDocumentKind', () => {
   });
 
   it('returns undefined for unsupported formats', () => {
-    expect(
-      detectDocumentKind(
-        'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-        'deck.pptx'
-      )
-    ).toBeUndefined();
+    expect(detectDocumentKind('application/vnd.ms-powerpoint', 'deck.ppt')).toBeUndefined();
     expect(detectDocumentKind(undefined, 'legacy.doc')).toBeUndefined();
+    expect(detectDocumentKind(undefined, 'legacy.xls')).toBeUndefined();
     expect(detectDocumentKind(undefined, undefined)).toBeUndefined();
   });
 });

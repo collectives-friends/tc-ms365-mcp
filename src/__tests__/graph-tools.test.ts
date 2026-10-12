@@ -3,6 +3,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { fileURLToPath } from 'url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import JSZip from 'jszip';
 import { z } from 'zod';
 
 /**
@@ -5114,15 +5115,15 @@ describe('graph-tools', () => {
     });
 
     it('rejects unsupported document types with guidance', async () => {
-      const pptxMime = 'application/vnd.openxmlformats-officedocument.presentationml.presentation';
+      const legacyMime = 'application/vnd.ms-powerpoint';
       const graphClient = {
         makeRequest: vi.fn().mockResolvedValue({
-          name: 'deck.pptx',
-          file: { mimeType: pptxMime },
+          name: 'deck.ppt',
+          file: { mimeType: legacyMime },
         }),
         downloadStream: vi.fn().mockResolvedValue({
           body: streamOf(Buffer.from('x')),
-          contentType: pptxMime,
+          contentType: legacyMime,
           contentLength: 1,
           contentDisposition: null,
         }),
@@ -5136,7 +5137,7 @@ describe('graph-tools', () => {
       expect(result.isError).toBe(true);
       const payload = JSON.parse(result.content[0].text);
       expect(payload.error).toMatch(/Unsupported document type/);
-      expect(payload.error).toMatch(/deck\.pptx/);
+      expect(payload.error).toMatch(/deck\.ppt/);
     });
 
     it('refuses documents over the byte cap and cancels the undrained body', async () => {
@@ -5235,6 +5236,154 @@ describe('graph-tools', () => {
       const httpServer = createMockServer();
       registerGraphTools(httpServer as any, {} as any, { httpMode: true });
       expect(httpServer.tools.has('extract-document-text')).toBe(true);
+    });
+
+    async function buildXlsxBytes(): Promise<Buffer> {
+      const zip = new JSZip();
+      zip.file(
+        'xl/workbook.xml',
+        '<?xml version="1.0"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" ' +
+          'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">' +
+          '<sheets><sheet name="Budget" sheetId="1" r:id="rId1"/></sheets></workbook>'
+      );
+      zip.file(
+        'xl/_rels/workbook.xml.rels',
+        '<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+          '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>' +
+          '</Relationships>'
+      );
+      zip.file(
+        'xl/sharedStrings.xml',
+        '<?xml version="1.0"?><sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">' +
+          '<si><t>Kvartals</t><t>regnskab</t></si></sst>'
+      );
+      zip.file(
+        'xl/worksheets/sheet1.xml',
+        '<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">' +
+          '<sheetData><row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1"><v>1234.5</v></c></row></sheetData></worksheet>'
+      );
+      return zip.generateAsync({ type: 'nodebuffer' });
+    }
+
+    async function buildPptxBytes(): Promise<Buffer> {
+      const zip = new JSZip();
+      zip.file(
+        'ppt/presentation.xml',
+        '<?xml version="1.0"?><p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" ' +
+          'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">' +
+          '<p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst></p:presentation>'
+      );
+      zip.file(
+        'ppt/_rels/presentation.xml.rels',
+        '<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+          '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/>' +
+          '</Relationships>'
+      );
+      zip.file(
+        'ppt/slides/slide1.xml',
+        '<?xml version="1.0"?><p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" ' +
+          'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree>' +
+          '<p:sp><p:txBody><a:p><a:r><a:t>Strategi 2027</a:t></a:r></a:p></p:txBody></p:sp>' +
+          '</p:spTree></p:cSld></p:sld>'
+      );
+      return zip.generateAsync({ type: 'nodebuffer' });
+    }
+
+    it('extracts spreadsheet text through the tool', async () => {
+      const xlsxMime = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+      const bytes = await buildXlsxBytes();
+      const graphClient = {
+        makeRequest: vi.fn().mockResolvedValue({
+          name: 'budget.xlsx',
+          file: { mimeType: xlsxMime },
+          webUrl: 'https://contoso.sharepoint.com/sites/team/Documents/budget.xlsx',
+        }),
+        downloadStream: vi.fn().mockResolvedValue({
+          body: streamOf(bytes),
+          contentType: xlsxMime,
+          contentLength: bytes.length,
+          contentDisposition: null,
+        }),
+      };
+      const server = await register(graphClient);
+
+      const result = await server.tools
+        .get('extract-document-text')!
+        .handler({ target: '/drives/drive-1/items/item-xlsx/content' });
+
+      expect(result.isError).toBeUndefined();
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.kind).toBe('xlsx');
+      expect(payload.name).toBe('budget.xlsx');
+      expect(payload.webUrl).toContain('budget.xlsx');
+      expect(payload.text).toContain('[Sheet: Budget]');
+      expect(payload.text).toContain('Kvartalsregnskab');
+      expect(payload.text).toContain('1234.5');
+    });
+
+    it('extracts presentation text through the tool', async () => {
+      const pptxMime = 'application/vnd.openxmlformats-officedocument.presentationml.presentation';
+      const bytes = await buildPptxBytes();
+      const graphClient = {
+        makeRequest: vi.fn().mockResolvedValue({
+          name: 'deck.pptx',
+          file: { mimeType: pptxMime },
+        }),
+        downloadStream: vi.fn().mockResolvedValue({
+          body: streamOf(bytes),
+          contentType: pptxMime,
+          contentLength: bytes.length,
+          contentDisposition: null,
+        }),
+      };
+      const server = await register(graphClient);
+
+      const result = await server.tools
+        .get('extract-document-text')!
+        .handler({ target: '/drives/drive-1/items/item-pptx/content' });
+
+      expect(result.isError).toBeUndefined();
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.kind).toBe('pptx');
+      expect(payload.text).toContain('[Slide 1]');
+      expect(payload.text).toContain('Strategi 2027');
+    });
+  });
+
+  // ---- 9c. search index utility tools ----
+  describe('search index utility tools', () => {
+    async function registerIndexTools(graphClient: unknown) {
+      mockEndpoints.length = 0;
+      mockEndpointsJson = [];
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+      return server;
+    }
+
+    it('registers the three index tools', async () => {
+      const server = await registerIndexTools({});
+      expect(server.tools.has('semantic-search')).toBe(true);
+      expect(server.tools.has('refresh-search-index')).toBe(true);
+      expect(server.tools.has('search-index-status')).toBe(true);
+    });
+
+    it('explains itself when the index has not been initialized', async () => {
+      const server = await registerIndexTools({});
+
+      const search = await server.tools.get('semantic-search')!.handler({ query: 'budget' });
+      expect(search.isError).toBe(true);
+      expect(JSON.parse(search.content[0].text).error).toMatch(/search index/i);
+
+      const refresh = await server.tools.get('refresh-search-index')!.handler({});
+      expect(refresh.isError).toBe(true);
+      expect(JSON.parse(refresh.content[0].text).error).toMatch(/search index/i);
+
+      const status = await server.tools.get('search-index-status')!.handler({});
+      expect(status.isError).toBeUndefined();
+      const payload = JSON.parse(status.content[0].text);
+      expect(payload.ready).toBe(false);
+      expect(payload.enabled).toBe(false);
     });
   });
 });

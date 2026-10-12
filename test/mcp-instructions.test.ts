@@ -40,10 +40,12 @@ describe('buildMcpServerInstructions', () => {
     expect(s).toContain('relative Microsoft Graph paths, not absolute URLs');
   });
 
-  it('routes Word/PDF text extraction to extract-document-text with webUrl citation', () => {
+  it('routes Word/Excel/PowerPoint/PDF text extraction to extract-document-text with webUrl citation', () => {
     const s = buildMcpServerInstructions({ ...baseCtx, discovery: false });
     expect(s).toContain('extract-document-text');
-    expect(s).toContain('Word (.docx), PDF or plain-text document');
+    expect(s).toContain(
+      'Word (.docx), Excel (.xlsx), PowerPoint (.pptx), PDF or plain-text document'
+    );
     expect(s).toContain('webUrl for citing the source');
   });
 });

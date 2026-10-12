@@ -2,7 +2,8 @@
  * Text extraction for the document formats extract-document-text serves.
  *
  * docx/docm go through mammoth (raw text, tables flattened), pdf through
- * unpdf's serverless PDF.js build. Both parsers are imported lazily so the
+ * unpdf's serverless PDF.js build, and xlsx/xlsm + pptx/pptm through the
+ * OOXML reader in ooxml-text.ts. All parsers are imported lazily so the
  * PDF.js payload is only paid for when a PDF is actually read, not on server
  * startup.
  *
@@ -16,11 +17,15 @@ export const DEFAULT_MAX_DOCUMENT_CHARS = 50_000;
 export const HARD_MAX_DOCUMENT_CHARS = 200_000;
 export const MAX_DOCUMENT_BYTES = 30 * 1024 * 1024;
 
-export type DocumentKind = 'docx' | 'pdf' | 'text';
+export type DocumentKind = 'docx' | 'xlsx' | 'pptx' | 'pdf' | 'text';
 
 const DOCX_MIME = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
 // Macro-enabled Word documents share the same OOXML package layout, and mammoth reads them.
 const DOCM_MIME = 'application/vnd.ms-word.document.macroenabled.12';
+const XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+const XLSM_MIME = 'application/vnd.ms-excel.sheet.macroenabled.12';
+const PPTX_MIME = 'application/vnd.openxmlformats-officedocument.presentationml.presentation';
+const PPTM_MIME = 'application/vnd.ms-powerpoint.presentation.macroenabled.12';
 const TEXT_MIME_TYPES = new Set([
   'text/plain',
   'text/markdown',
@@ -31,7 +36,7 @@ const TEXT_MIME_TYPES = new Set([
 const TEXT_EXTENSIONS = new Set(['txt', 'text', 'md', 'markdown', 'csv', 'json', 'log']);
 
 export const SUPPORTED_DOCUMENT_DESCRIPTION =
-  'Word (.docx, .docm), PDF (.pdf), and plain-text (.txt, .md, .csv, .json, .log) documents';
+  'Word (.docx, .docm), Excel (.xlsx, .xlsm), PowerPoint (.pptx, .pptm), PDF (.pdf), and plain-text (.txt, .md, .csv, .json, .log) documents';
 
 function fileExtension(fileName: string | undefined): string | undefined {
   if (!fileName) return undefined;
@@ -56,6 +61,8 @@ export function detectDocumentKind(
   const mime = normalizeMimeType(mimeType);
   const ext = fileExtension(fileName);
   if (mime === DOCX_MIME || mime === DOCM_MIME || ext === 'docx' || ext === 'docm') return 'docx';
+  if (mime === XLSX_MIME || mime === XLSM_MIME || ext === 'xlsx' || ext === 'xlsm') return 'xlsx';
+  if (mime === PPTX_MIME || mime === PPTM_MIME || ext === 'pptx' || ext === 'pptm') return 'pptx';
   if (mime === 'application/pdf' || ext === 'pdf') return 'pdf';
   if (TEXT_MIME_TYPES.has(mime) || (ext !== undefined && TEXT_EXTENSIONS.has(ext))) return 'text';
   return undefined;
@@ -119,6 +126,10 @@ export async function extractDocumentText(bytes: Buffer, kind: DocumentKind): Pr
     const mammoth = await loadMammoth();
     const result = await mammoth.extractRawText({ buffer: bytes });
     return result.value;
+  }
+  if (kind === 'xlsx' || kind === 'pptx') {
+    const ooxml = await import('./ooxml-text.js');
+    return kind === 'xlsx' ? ooxml.extractXlsxText(bytes) : ooxml.extractPptxText(bytes);
   }
   const { extractText, getDocumentProxy } = await loadUnpdf();
   // Pass a view instead of copying the Buffer's bytes into a new Uint8Array.

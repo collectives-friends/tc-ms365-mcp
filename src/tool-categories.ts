@@ -104,6 +104,11 @@ const SCOPED_UTILITY_TOOLS: Record<string, string[]> = {
   // like get-download-url (a PDF mail attachment is still readable there after
   // download-bytes, but document reading is a drive-shaped task).
   'extract-document-text': ['files', 'onedrive', 'personal', 'work', 'search'],
+  // The semantic index covers the same drive documents as extract-document-text,
+  // so the three index tools ride with the same presets.
+  'semantic-search': ['files', 'onedrive', 'personal', 'work', 'search'],
+  'refresh-search-index': ['files', 'onedrive', 'personal', 'work', 'search'],
+  'search-index-status': ['files', 'onedrive', 'personal', 'work', 'search'],
 };
 
 // Fail fast if a scoped utility references a preset that does not exist (e.g. a typo like
