@@ -1,11 +1,11 @@
 /**
  * Text extraction for the document formats extract-document-text serves.
  *
- * docx/docm go through mammoth (raw text, tables flattened), pdf through
- * unpdf's serverless PDF.js build, and xlsx/xlsm + pptx/pptm through the
- * OOXML reader in ooxml-text.ts. All parsers are imported lazily so the
- * PDF.js payload is only paid for when a PDF is actually read, not on server
- * startup.
+ * docx/docm go through mammoth (raw text, tables flattened) after the OOXML
+ * reader's part-size guard, pdf through unpdf's serverless PDF.js build, and
+ * xlsx/xlsm + pptx/pptm through the OOXML reader in ooxml-text.ts. All parsers
+ * are imported lazily so the PDF.js payload is only paid for when a PDF is
+ * actually read, not on server startup.
  *
  * Resource limits are the caller's job: this module never reads from the
  * network, and extract-document-text caps the bytes before parsing. Extraction
@@ -148,6 +148,8 @@ export async function extractDocumentText(
     return bytes.toString('utf8').slice(0, maxChars);
   }
   if (kind === 'docx') {
+    const ooxml = await import('./ooxml-text.js');
+    await ooxml.assertDocxWithinPartBound(bytes);
     const mammoth = await loadMammoth();
     const result = await mammoth.extractRawText({ buffer: bytes });
     return result.value.slice(0, maxChars);

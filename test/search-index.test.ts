@@ -285,6 +285,18 @@ describe('document kinds and OOXML extraction', () => {
     const bytes = await zip.generateAsync({ type: 'nodebuffer' });
     await expect(extractDocumentText(bytes, 'pptx')).rejects.toThrow(/too large/i);
   });
+
+  it('rejects a docx whose main document part would expand past the safe bound', async () => {
+    const zip = new JSZip();
+    zip.file(
+      'word/document.xml',
+      `<?xml version="1.0"?><w:document><w:body><w:p><w:r><w:t>${'x'.repeat(
+        MAX_UNCOMPRESSED_PART_BYTES + 1
+      )}</w:t></w:r></w:p></w:body></w:document>`
+    );
+    const bytes = await zip.generateAsync({ type: 'nodebuffer' });
+    await expect(extractDocumentText(bytes, 'docx')).rejects.toThrow(/too large/i);
+  });
 });
 
 describe('chunkText', () => {

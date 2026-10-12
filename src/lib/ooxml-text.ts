@@ -98,6 +98,24 @@ async function readPart(zip: ZipArchive, partPath: string): Promise<string | und
   return entry.async('string');
 }
 
+/**
+ * Reject a Word package whose main document part would expand past the safe
+ * part bound before mammoth parses it. An unreadable package passes through:
+ * mammoth then reports the real read error.
+ */
+export async function assertDocxWithinPartBound(bytes: Buffer): Promise<void> {
+  let uncompressedSize: number | undefined;
+  try {
+    const zip = await openZip(bytes, 'document');
+    uncompressedSize = zip.file('word/document.xml')?._data?.uncompressedSize;
+  } catch {
+    return;
+  }
+  if (typeof uncompressedSize === 'number' && uncompressedSize > MAX_UNCOMPRESSED_PART_BYTES) {
+    throw new Error('The document is too large to extract safely.');
+  }
+}
+
 async function parseXml(xml: string): Promise<XmlNode> {
   const xmldom = await loadXmldom();
   return new xmldom.DOMParser().parseFromString(xml, 'text/xml');
