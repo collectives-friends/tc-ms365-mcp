@@ -2049,6 +2049,10 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
           );
         }
         const bytes = await readDocumentBytesWithCap(stream.body, MAX_DOCUMENT_BYTES);
+        // pdfjs transfers (and thereby detaches) the source buffer for standalone
+        // buffers during PDF extraction, so capture the byte size before
+        // extractDocumentText runs.
+        const documentSize = bytes.length;
         const fileName =
           itemMetadata?.name ?? fileNameFromContentDisposition(stream.contentDisposition);
         const responseMime = normalizeMimeType(stream.contentType);
@@ -2065,7 +2069,7 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
           ...(fileName ? { name: fileName } : {}),
           ...(itemMetadata?.webUrl ? { webUrl: itemMetadata.webUrl } : {}),
           ...(mimeType ? { mimeType } : {}),
-          size: bytes.length,
+          size: documentSize,
           kind,
           charCount: fullText.length,
           offset,

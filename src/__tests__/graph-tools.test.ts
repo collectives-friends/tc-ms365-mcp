@@ -5006,6 +5006,37 @@ describe('graph-tools', () => {
       );
     });
 
+    it('keeps the byte size when pdfjs detaches the source buffer during extraction', async () => {
+      // pdfjs transfers standalone source buffers (documents above the 8 KiB
+      // Node Buffer pool) to its worker, which detaches the buffer the tool
+      // still holds. The payload byte size must be captured before extraction.
+      const fixture = readFileSync(pdfFixture);
+      const bytes = Buffer.concat([fixture, Buffer.alloc(128 * 1024, 0x41)]);
+      const graphClient = {
+        makeRequest: vi.fn().mockResolvedValue({
+          name: 'big.pdf',
+          file: { mimeType: 'application/pdf' },
+        }),
+        downloadStream: vi.fn().mockResolvedValue({
+          body: streamOf(bytes),
+          contentType: 'application/pdf',
+          contentLength: bytes.length,
+          contentDisposition: null,
+        }),
+      };
+      const server = await register(graphClient);
+
+      const result = await server.tools
+        .get('extract-document-text')!
+        .handler({ target: '/drives/drive-1/items/item-pdf-large' });
+
+      expect(result.isError).toBeUndefined();
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.kind).toBe('pdf');
+      expect(payload.text).toContain('Hello from the minimal PDF fixture.');
+      expect(payload.size).toBe(bytes.length);
+    });
+
     it('pages long documents with offset/maxChars and nextOffset', async () => {
       const graphClient = docxGraphClient();
       const server = await register(graphClient);
