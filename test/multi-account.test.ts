@@ -1,9 +1,9 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { registerGraphTools } from '../src/graph-tools.js';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { registerAuthTools } from '../src/auth-tools.js';
-import GraphClient from '../src/graph-client.js';
 import AuthManager from '../src/auth.js';
+import GraphClient from '../src/graph-client.js';
+import { registerGraphTools } from '../src/graph-tools.js';
 
 vi.mock('../src/logger.js', () => ({
   default: {
@@ -13,6 +13,7 @@ vi.mock('../src/logger.js', () => ({
   },
 }));
 
+vi.mock('../src/generated/client-beta.js', () => ({ api: { endpoints: [] } }));
 vi.mock('../src/generated/client.js', () => ({
   api: {
     endpoints: [
@@ -31,45 +32,48 @@ describe('Multi-account support', () => {
   let graphClient: GraphClient;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any -- McpServer.tool() has ~6 overloads; spying it requires any
   let toolSpy: any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let registerToolSpy: any;
 
   beforeEach(() => {
     server = new McpServer({ name: 'test', version: '1.0.0' });
     graphClient = {} as GraphClient;
     toolSpy = vi.spyOn(server, 'tool').mockImplementation((() => {}) as any);
+    registerToolSpy = vi.spyOn(server, 'registerTool').mockImplementation((() => {}) as any);
   });
 
   describe('account parameter injection (Layer 2)', () => {
     it('should inject account param with known accounts in description when multiAccount=true', () => {
-      registerGraphTools(server, graphClient, false, undefined, false, undefined, true, [
-        'user@outlook.com',
-        'work@company.com',
-      ]);
+      registerGraphTools(server, graphClient, {
+        multiAccount: true,
+        accountNames: ['user@outlook.com', 'work@company.com'],
+      });
 
-      const toolCall = toolSpy.mock.calls.find(([name]) => name === 'list-mail-messages');
+      const toolCall = registerToolSpy.mock.calls.find(([name]) => name === 'list-mail-messages');
       expect(toolCall).toBeDefined();
 
-      // Schema is the 3rd argument (index 2)
-      const schema = toolCall![2] as Record<string, unknown>;
+      const schema = toolCall![1].inputSchema.shape as Record<string, unknown>;
       expect(schema).toHaveProperty('account');
     });
 
     it('should not inject account param when multiAccount=false', () => {
-      registerGraphTools(server, graphClient, false);
+      registerGraphTools(server, graphClient);
 
-      const toolCall = toolSpy.mock.calls.find(([name]) => name === 'list-mail-messages');
+      const toolCall = registerToolSpy.mock.calls.find(([name]) => name === 'list-mail-messages');
       expect(toolCall).toBeDefined();
 
-      const schema = toolCall![2] as Record<string, unknown>;
+      const schema = toolCall![1].inputSchema.shape as Record<string, unknown>;
       expect(schema).not.toHaveProperty('account');
     });
 
     it('should use z.string (not z.enum) to accept mid-session accounts', () => {
-      registerGraphTools(server, graphClient, false, undefined, false, undefined, true, [
-        'user@outlook.com',
-      ]);
+      registerGraphTools(server, graphClient, {
+        multiAccount: true,
+        accountNames: ['user@outlook.com'],
+      });
 
-      const toolCall = toolSpy.mock.calls.find(([name]) => name === 'list-mail-messages');
-      const schema = toolCall![2] as Record<string, unknown>;
+      const toolCall = registerToolSpy.mock.calls.find(([name]) => name === 'list-mail-messages');
+      const schema = toolCall![1].inputSchema.shape as Record<string, unknown>;
       // account should be a Zod string type, not enum — verify it's present and optional
       expect(schema).toHaveProperty('account');
     });
@@ -84,16 +88,11 @@ describe('Multi-account support', () => {
         getSelectedAccountId: vi.fn().mockReturnValue(null),
       };
 
-      registerGraphTools(
-        server,
-        graphClient,
-        false,
-        undefined,
-        false,
-        mockAuthManager as any,
-        true,
-        ['user@outlook.com']
-      );
+      registerGraphTools(server, graphClient, {
+        authManager: mockAuthManager as any,
+        multiAccount: true,
+        accountNames: ['user@outlook.com'],
+      });
 
       const listAccountsCalls = toolSpy.mock.calls.filter(([name]) => name === 'list-accounts');
       expect(listAccountsCalls).toHaveLength(0);
@@ -115,16 +114,11 @@ describe('Multi-account support', () => {
 
       // Simulate server boot: auth-tools first, then graph-tools
       registerAuthTools(server as any, mockAuthManager as any);
-      registerGraphTools(
-        server,
-        graphClient,
-        false,
-        undefined,
-        false,
-        mockAuthManager as any,
-        true,
-        ['user@outlook.com']
-      );
+      registerGraphTools(server, graphClient, {
+        authManager: mockAuthManager as any,
+        multiAccount: true,
+        accountNames: ['user@outlook.com'],
+      });
 
       const listAccountsCalls = toolSpy.mock.calls.filter(([name]) => name === 'list-accounts');
       expect(listAccountsCalls).toHaveLength(1);
@@ -145,6 +139,7 @@ describe('Multi-account support', () => {
         selectAccount: vi.fn(),
         removeAccount: vi.fn(),
         hasExpectedAccount: vi.fn().mockReturnValue(false),
+        isOAuthModeEnabled: vi.fn().mockReturnValue(false),
       };
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any -- handler type varies across McpServer.tool() overloads
@@ -195,6 +190,7 @@ describe('Multi-account support', () => {
         selectAccount: vi.fn(),
         removeAccount: vi.fn(),
         hasExpectedAccount: vi.fn().mockReturnValue(true),
+        isOAuthModeEnabled: vi.fn().mockReturnValue(false),
       };
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any -- handler type varies across McpServer.tool() overloads
@@ -299,19 +295,14 @@ describe('Multi-account support', () => {
           expectedHomeAccountId: null,
         });
 
-        registerGraphTools(
-          server,
-          graphClient,
-          false,
-          undefined,
-          false,
+        registerGraphTools(server, graphClient, {
           authManager,
-          await authManager.isMultiAccount(),
-          ['user@outlook.com', 'work@company.com']
-        );
+          multiAccount: await authManager.isMultiAccount(),
+          accountNames: ['user@outlook.com', 'work@company.com'],
+        });
 
-        const toolCall = toolSpy.mock.calls.find(([name]) => name === 'list-mail-messages');
-        const schema = toolCall![2] as Record<string, unknown>;
+        const toolCall = registerToolSpy.mock.calls.find(([name]) => name === 'list-mail-messages');
+        const schema = toolCall![1].inputSchema.shape as Record<string, unknown>;
         expect(schema).not.toHaveProperty('account');
       });
     });
