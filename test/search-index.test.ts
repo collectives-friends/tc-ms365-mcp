@@ -4,6 +4,7 @@ import { join } from 'path';
 import JSZip from 'jszip';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { detectDocumentKind, extractDocumentText } from '../src/lib/document-text.js';
+import { MAX_UNCOMPRESSED_PART_BYTES } from '../src/lib/ooxml-text.js';
 import {
   loadSearchIndexConfig,
   validateSearchIndexConfig,
@@ -273,6 +274,16 @@ describe('document kinds and OOXML extraction', () => {
     await expect(extractDocumentText(Buffer.from('not a zip at all'), 'pptx')).rejects.toThrow(
       /presentation could not be read/i
     );
+  });
+
+  it('rejects a package part that would expand past the safe extraction bound', async () => {
+    const zip = new JSZip();
+    zip.file(
+      'ppt/slides/slide1.xml',
+      `<?xml version="1.0"?><p:sld><a:t>${'x'.repeat(MAX_UNCOMPRESSED_PART_BYTES + 1)}</a:t></p:sld>`
+    );
+    const bytes = await zip.generateAsync({ type: 'nodebuffer' });
+    await expect(extractDocumentText(bytes, 'pptx')).rejects.toThrow(/too large/i);
   });
 });
 

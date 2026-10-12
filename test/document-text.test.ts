@@ -73,6 +73,11 @@ describe('extractDocumentText', () => {
     expect(text).toBe('hej med dig');
   });
 
+  it('caps extraction output at the requested character budget', async () => {
+    const text = await extractDocumentText(Buffer.from('abcdefghij'), 'text', { maxChars: 4 });
+    expect(text).toBe('abcd');
+  });
+
   it('rejects empty documents', async () => {
     await expect(extractDocumentText(Buffer.alloc(0), 'text')).rejects.toThrow(/empty/i);
   });

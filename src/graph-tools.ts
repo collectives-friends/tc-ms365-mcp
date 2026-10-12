@@ -9,6 +9,7 @@ import { z } from 'zod';
 import { applyDefaultSelect, stripSelectFromPath, isSelectError } from './default-query-params.js';
 import {
   DEFAULT_MAX_DOCUMENT_CHARS,
+  EXTRACTION_MAX_CHARS,
   HARD_MAX_DOCUMENT_CHARS,
   MAX_DOCUMENT_BYTES,
   SUPPORTED_DOCUMENT_DESCRIPTION,
@@ -2066,6 +2067,12 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
         }
         const fullText = await extractDocumentText(bytes, kind);
         const page = pageDocumentText(fullText, offset, maxChars);
+        const note =
+          fullText.trim().length === 0
+            ? 'No extractable text was found; the document may be a scan or contain only images. OCR is not supported.'
+            : fullText.length >= EXTRACTION_MAX_CHARS
+              ? `Text extraction stops at ${EXTRACTION_MAX_CHARS} characters; the document is longer and the remaining text was not extracted.`
+              : undefined;
         const payload = {
           ...(fileName ? { name: fileName } : {}),
           ...(itemMetadata?.webUrl ? { webUrl: itemMetadata.webUrl } : {}),
@@ -2078,11 +2085,7 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
           returnedChars: page.text.length,
           truncated: page.truncated,
           ...(page.nextOffset !== undefined ? { nextOffset: page.nextOffset } : {}),
-          ...(fullText.trim().length === 0
-            ? {
-                note: 'No extractable text was found; the document may be a scan or contain only images. OCR is not supported.',
-              }
-            : {}),
+          ...(note ? { note } : {}),
           text: page.text,
         };
         const payloadText = JSON.stringify(payload);

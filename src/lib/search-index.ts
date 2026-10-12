@@ -695,7 +695,9 @@ async function indexItemContent(
         return 'skipped';
       }
       const bytes = await readBytesWithCap(stream.body, active.config.maxFileBytes);
-      const text = await extractDocumentText(bytes, kind);
+      const text = await extractDocumentText(bytes, kind, {
+        maxChars: active.config.maxCharsPerDoc,
+      });
       const capped = text.slice(0, active.config.maxCharsPerDoc);
       if (!capped.trim()) {
         active.store.upsertItem({ ...input, state: 'skipped', skipReason: 'empty' });

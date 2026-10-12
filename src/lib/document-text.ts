@@ -8,14 +8,22 @@
  * startup.
  *
  * Resource limits are the caller's job: this module never reads from the
- * network, and extract-document-text caps the bytes (and characters) before
- * parsing. Parsing itself is CPU-bound and runs on the server's event loop, so
- * the byte cap is also the latency guard.
+ * network, and extract-document-text caps the bytes before parsing. Extraction
+ * itself is additionally bounded by EXTRACTION_MAX_CHARS so no single document
+ * can expand into unbounded text, and the PDF walk releases each page as it
+ * goes instead of holding the whole document open. Parsing is CPU-bound and
+ * runs on the server's event loop, so the byte cap is also the latency guard.
  */
 
 export const DEFAULT_MAX_DOCUMENT_CHARS = 50_000;
 export const HARD_MAX_DOCUMENT_CHARS = 200_000;
 export const MAX_DOCUMENT_BYTES = 30 * 1024 * 1024;
+/**
+ * Upper bound on the text one extraction pass materializes. The OOXML reader
+ * applies the same bound internally (OOXML_MAX_TEXT_CHARS); without it a PDF
+ * would stream every page of the document into one string.
+ */
+export const EXTRACTION_MAX_CHARS = 2_000_000;
 
 export type DocumentKind = 'docx' | 'xlsx' | 'pptx' | 'pdf' | 'text';
 
@@ -87,56 +95,117 @@ async function loadMammoth(): Promise<MammothModule> {
  * unpdf's published type surface imports the optional native @napi-rs/canvas
  * package (rendering), which this server never installs or uses. Loading the
  * module through a non-literal specifier keeps the type graph out of the build
- * - the runtime import itself is unchanged - and the local type below covers
- * the two text-extraction entry points we call.
+ * - the runtime import itself is unchanged - and the local types below cover
+ * the page-by-page surface the PDF walk uses.
  */
 const UNPDF_SPECIFIER = 'unpdf';
 
+interface PdfTextItem {
+  str?: string;
+  hasEOL?: boolean;
+}
+
+interface PdfPageHandle {
+  getTextContent(): Promise<{ items: PdfTextItem[] }>;
+  cleanup?(): unknown;
+}
+
+interface PdfDocumentHandle {
+  numPages: number;
+  getPage(pageNumber: number): Promise<PdfPageHandle>;
+  destroy?(): unknown;
+}
+
 type UnpdfModule = {
-  getDocumentProxy(data: Uint8Array): Promise<unknown>;
-  extractText(
-    data: unknown,
-    options?: { mergePages?: boolean }
-  ): Promise<{ totalPages: number; text: string | string[] }>;
+  getDocumentProxy(data: Uint8Array): Promise<PdfDocumentHandle>;
 };
 
 async function loadUnpdf(): Promise<UnpdfModule> {
   const imported: unknown = await import(UNPDF_SPECIFIER);
   const candidate = (imported as { default?: unknown }).default ?? imported;
-  const extractText = (candidate as { extractText?: unknown }).extractText;
   const getDocumentProxy = (candidate as { getDocumentProxy?: unknown }).getDocumentProxy;
-  if (typeof extractText !== 'function' || typeof getDocumentProxy !== 'function') {
-    throw new Error('unpdf did not expose extractText/getDocumentProxy');
+  if (typeof getDocumentProxy !== 'function') {
+    throw new Error('unpdf did not expose getDocumentProxy');
   }
   return candidate as UnpdfModule;
 }
 
 /**
- * Extract the full plain text of `bytes`. Throws with a user-presentable
- * message for corrupt, encrypted or otherwise unreadable documents.
+ * Extract the full plain text of `bytes`, at most `maxChars` characters.
+ * Throws with a user-presentable message for corrupt, encrypted or otherwise
+ * unreadable documents.
  */
-export async function extractDocumentText(bytes: Buffer, kind: DocumentKind): Promise<string> {
+export async function extractDocumentText(
+  bytes: Buffer,
+  kind: DocumentKind,
+  options: { maxChars?: number } = {}
+): Promise<string> {
+  const maxChars = options.maxChars ?? EXTRACTION_MAX_CHARS;
   if (bytes.length === 0) {
     throw new Error('The document is empty (0 bytes).');
   }
   if (kind === 'text') {
-    return bytes.toString('utf8');
+    return bytes.toString('utf8').slice(0, maxChars);
   }
   if (kind === 'docx') {
     const mammoth = await loadMammoth();
     const result = await mammoth.extractRawText({ buffer: bytes });
-    return result.value;
+    return result.value.slice(0, maxChars);
   }
   if (kind === 'xlsx' || kind === 'pptx') {
     const ooxml = await import('./ooxml-text.js');
     return kind === 'xlsx' ? ooxml.extractXlsxText(bytes) : ooxml.extractPptxText(bytes);
   }
-  const { extractText, getDocumentProxy } = await loadUnpdf();
   // Pass a view instead of copying the Buffer's bytes into a new Uint8Array.
   const data = new Uint8Array(bytes.buffer as ArrayBuffer, bytes.byteOffset, bytes.byteLength);
+  return extractPdfText(data, maxChars);
+}
+
+/**
+ * unpdf's `extractText` starts every page at once (`Promise.all` over the page
+ * range) and never releases a document the caller handed it, so a large PDF
+ * both spikes and leaks memory. This walk reads one page at a time, cleans the
+ * page up before moving on, stops once `maxChars` are collected, and destroys
+ * the document in every case. Text assembly mirrors unpdf's: items joined per
+ * page with `hasEOL` line breaks, pages joined with newlines and whitespace
+ * collapsed without flattening lines.
+ */
+async function extractPdfText(data: Uint8Array, maxChars: number): Promise<string> {
+  const { getDocumentProxy } = await loadUnpdf();
   const pdf = await getDocumentProxy(data);
-  const result = await extractText(pdf, { mergePages: true });
-  return typeof result.text === 'string' ? result.text : result.text.join('\n\n');
+  try {
+    const pages: string[] = [];
+    let collected = 0;
+    for (let pageNumber = 1; pageNumber <= pdf.numPages && collected < maxChars; pageNumber++) {
+      const page = await pdf.getPage(pageNumber);
+      try {
+        const content = await page.getTextContent();
+        const text = content.items
+          .filter((item) => item.str != null)
+          .map((item) => `${item.str ?? ''}${item.hasEOL ? '\n' : ''}`)
+          .join('');
+        pages.push(text);
+        collected += text.length + 1;
+      } finally {
+        page.cleanup?.();
+      }
+    }
+    return normalizeMergedPdfText(pages).slice(0, maxChars);
+  } finally {
+    try {
+      await pdf.destroy?.();
+    } catch {
+      // Cleanup is best-effort; a destroy failure must not mask the result.
+    }
+  }
+}
+
+function normalizeMergedPdfText(pages: string[]): string {
+  return pages
+    .join('\n')
+    .replace(/[^\S\n]+/g, ' ')
+    .replace(/ ?\n ?/g, '\n')
+    .replace(/\n{3,}/g, '\n\n');
 }
 
 /**

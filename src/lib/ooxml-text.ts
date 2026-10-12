@@ -17,6 +17,13 @@
  */
 
 export const OOXML_MAX_TEXT_CHARS = 2_000_000;
+/**
+ * Upper bound on one decompressed package part. The XML DOM for a part costs
+ * many times the part's own bytes, so a part beyond this bound would risk the
+ * whole process instead of one document; such packages are reported as
+ * unreadable rather than parsed.
+ */
+export const MAX_UNCOMPRESSED_PART_BYTES = 32 * 1024 * 1024;
 
 const RELATIONSHIPS_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
 
@@ -26,6 +33,12 @@ const RELATIONSHIPS_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/
 // out of the build.
 interface ZipEntryHandle {
   async(type: 'string'): Promise<string>;
+  /**
+   * The decompressed size jszip read from the zip central directory. Not part
+   * of jszip's documented API, but stable across 3.x and the only way to reject
+   * a part before it is decompressed into memory.
+   */
+  _data?: { uncompressedSize?: number };
 }
 
 interface ZipArchive {
@@ -77,7 +90,12 @@ async function openZip(bytes: Buffer, label: string): Promise<ZipArchive> {
 
 async function readPart(zip: ZipArchive, partPath: string): Promise<string | undefined> {
   const entry = zip.file(partPath);
-  return entry ? entry.async('string') : undefined;
+  if (!entry) return undefined;
+  const uncompressedSize = entry._data?.uncompressedSize;
+  if (typeof uncompressedSize === 'number' && uncompressedSize > MAX_UNCOMPRESSED_PART_BYTES) {
+    throw new Error('The document is too large to extract safely.');
+  }
+  return entry.async('string');
 }
 
 async function parseXml(xml: string): Promise<XmlNode> {
