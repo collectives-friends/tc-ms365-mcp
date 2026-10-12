@@ -1,11 +1,17 @@
-import type { AccountInfo, Configuration } from '@azure/msal-node';
-import { PublicClientApplication } from '@azure/msal-node';
+import type { AccountInfo, Configuration, ICachePlugin, TokenCacheContext } from '@azure/msal-node';
+import { AuthError, PublicClientApplication } from '@azure/msal-node';
 import logger from './logger.js';
 import { readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import path from 'path';
 import { getSecrets, type AppSecrets } from './secrets.js';
-import { getCloudEndpoints, getDefaultClientId } from './cloud-config.js';
+import { getCloudEndpoints, getDefaultClientId, getGraphBaseUrl } from './cloud-config.js';
+import {
+  dedupeRefreshTokens,
+  type CanonicalKeyFor,
+  type DroppedRefreshToken,
+  type RefreshTokenDedupe,
+} from './lib/cache-dedupe.js';
 import {
   createTokenCacheStorage,
   DefaultTokenCacheStorage,
@@ -21,10 +27,14 @@ interface EndpointConfig {
   pathPattern: string;
   method: string;
   toolName: string;
-  scopes?: string[];
-  workScopes?: string[];
+  // A flat string[] is a single AND-group (all scopes required). A nested string[][]
+  // expresses alternatives: the endpoint is satisfied if ALL scopes in ANY one group are
+  // held (e.g. copilot-retrieve needs Files.Read.All + Sites.Read.All, OR ExternalItem.Read.All).
+  scopes?: string[] | string[][];
+  workScopes?: string[] | string[][];
   llmTip?: string;
   readOnly?: boolean;
+  presets?: string[]; // Presets this endpoint belongs to (mail, outlook, personal, ...)
 }
 
 const __filename = fileURLToPath(import.meta.url);
@@ -51,11 +61,212 @@ function createMsalConfig(secrets: AppSecrets): Configuration {
   };
 }
 
+/**
+ * Duplicate refresh tokens are a property of the cache, not of one read, so the warning
+ * belongs to the process rather than to every access that reloads the same file.
+ */
+const warnedDuplicateRefreshTokens = new Set<string>();
+
+/**
+ * Accounts whose duplicate refresh tokens the last load could not rank. Per account, not
+ * one flag for the cache: the remedy is a logout, which drops every account, so blaming
+ * A's failure on B's duplicate would talk someone into signing all of them out.
+ */
+let unresolvedDuplicateAccounts = new Set<string>();
+
+/** Test seam: the warnings above are deduplicated for the process lifetime. */
+export function resetRefreshTokenWarningsForTests(): void {
+  warnedDuplicateRefreshTokens.clear();
+  unresolvedDuplicateAccounts = new Set<string>();
+}
+
+/**
+ * MSAL's own key builder, reached through the NodeStorage behind the token cache.
+ *
+ * Not exported from the package root and deep imports are blocked, so this hop is the only
+ * way to ask MSAL instead of reimplementing its format - and reimplementing the format is
+ * what made this mess. Anything unexpected returns undefined, which skips the pass.
+ */
+function canonicalKeyResolver(tokenCache: unknown): CanonicalKeyFor | undefined {
+  const storage = (tokenCache as { storage?: { generateCredentialKey?: unknown } })?.storage;
+  const generate = storage?.generateCredentialKey;
+  if (typeof generate !== 'function') return undefined;
+
+  return (entity) => {
+    if (!entity.home_account_id || !entity.environment || !entity.client_id) return undefined;
+    try {
+      const key = (generate as (c: unknown) => unknown).call(storage, {
+        homeAccountId: entity.home_account_id,
+        environment: entity.environment,
+        credentialType: 'RefreshToken',
+        clientId: entity.client_id,
+        ...(entity.family_id ? { familyId: entity.family_id } : {}),
+        // Each of these owns a segment of the key. MSAL does not put them on refresh tokens
+        // today, but a serialized entity can carry them, and dropping them would map two
+        // different credentials onto one key - and then this deletes a live one
+        ...(entity.realm ? { realm: entity.realm } : {}),
+        ...(entity.target ? { target: entity.target } : {}),
+        ...(entity.token_type ? { tokenType: entity.token_type } : {}),
+        secret: entity.secret ?? '',
+      });
+      return typeof key === 'string' ? key : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+}
+
+function pruneDuplicateRefreshTokens(data: string, tokenCache?: unknown): RefreshTokenDedupe {
+  const result = dedupeRefreshTokens(
+    data,
+    tokenCache === undefined ? undefined : canonicalKeyResolver(tokenCache)
+  );
+
+  for (const drop of result.dropped) {
+    const signature = `${drop.environment}->${drop.keptEnvironment}`;
+    if (warnedDuplicateRefreshTokens.has(signature)) continue;
+    warnedDuplicateRefreshTokens.add(signature);
+    logger.warn(
+      `Dropped a stale refresh token cached under ${drop.environment}, keeping the one under ` +
+        `${drop.keptEnvironment}. MSAL treats those as the same account and spends whichever it ` +
+        `finds first, which is what strands a sign-in on a months-old token (issue #648).`
+    );
+  }
+
+  unresolvedDuplicateAccounts = new Set(result.ambiguousAccounts);
+
+  if (result.ambiguous > 0 && !warnedDuplicateRefreshTokens.has('ambiguous')) {
+    warnedDuplicateRefreshTokens.add('ambiguous');
+    logger.warn(
+      `The auth cache holds ${result.ambiguous} set(s) of duplicate refresh tokens with nothing to ` +
+        `say which is current, so they were left alone. If silent refresh keeps failing for an ` +
+        `account, log out and sign in again to clear them.`
+    );
+  }
+
+  return result;
+}
+
+/**
+ * Removes the dropped entries from the store MSAL actually reads.
+ *
+ * `deserialize` merges into the key-value store instead of replacing it, so a key removed
+ * from the blob survives in the store `getRefreshToken` reads - and `serialize()` writes it
+ * straight back out. Pruning the blob alone only works while that store is still empty,
+ * which is the first access after startup and nothing else (issue #648).
+ *
+ * `getKVStore()` hands back the live object so deleting sticks. Not via setCache: that
+ * emits a change event, and a prune is no reason to force a write.
+ */
+function dropFromKVStore(tokenCache: unknown, dropped: DroppedRefreshToken[]): void {
+  if (dropped.length === 0) return;
+  const store = (tokenCache as { getKVStore?: () => Record<string, unknown> }).getKVStore?.();
+  if (!store) return;
+  for (const drop of dropped) {
+    delete store[drop.key];
+  }
+}
+
+/** How long to wait before a second look at the cache, when the first came up short. */
+const PERSISTENCE_RECHECK_MS = 150;
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Refresh token secrets a serialized cache holds for one account. `undefined` means the
+ * blob did not read back as a cache at all, which is not the same as holding no tokens.
+ */
+function persistedRefreshTokens(cacheJson: string, homeAccountId: string): Set<string> | undefined {
+  let refreshTokens: unknown;
+  try {
+    const parsed: unknown = JSON.parse(cacheJson);
+    if (typeof parsed !== 'object' || parsed === null) return undefined;
+    refreshTokens = (parsed as { RefreshToken?: unknown }).RefreshToken;
+  } catch {
+    return undefined;
+  }
+
+  const secrets = new Set<string>();
+  // A cache with no refresh tokens at all is readable and simply empty.
+  if (typeof refreshTokens !== 'object' || refreshTokens === null) return secrets;
+
+  for (const entity of Object.values(refreshTokens as Record<string, unknown>)) {
+    if (typeof entity !== 'object' || entity === null) continue;
+    const credential = entity as { home_account_id?: string; secret?: string };
+    if (credential.home_account_id !== homeAccountId) continue;
+    if (credential.secret) secrets.add(credential.secret);
+  }
+  return secrets;
+}
+
+/**
+ * Builds an MSAL cache plugin that keeps the file-backed token cache coherent across
+ * concurrent processes. In the common stdio deployment several MCP server processes share
+ * one token cache file. Microsoft rotates refresh tokens on silent refresh, so without this
+ * plugin a process holds whatever it loaded at startup and fails once a sibling rotates the
+ * refresh token on disk (invalid_grant / no_tokens_found). See issue #545.
+ *
+ * MSAL invokes beforeCacheAccess/afterCacheAccess around every cache operation, so:
+ *  - beforeCacheAccess reloads the newest persisted cache into MSAL right before each access,
+ *    collapsing duplicate refresh tokens on the way in (see cache-dedupe, issue #648)
+ *  - afterCacheAccess persists (atomically, via storage) only when MSAL changed the cache
+ * This preserves the existing cache envelope (wrapCache) and the storage provider's
+ * fail-closed semantics.
+ *
+ * This is best-effort, last-writer-wins reconciliation (the storage layer breaks ties via
+ * the savedAt stamp), not a cross-process lock. It closes the dominant #545 window - a
+ * long-lived sibling refreshing against a token another process already rotated on disk.
+ * Two known limits remain, both accepted as out of scope in the #545 discussion:
+ *  - Two processes refreshing the very same refresh token at the same instant can still race.
+ *  - A sibling logout is not reflected in an already-running process: load() returns nothing
+ *    so the deletion is not picked up (the deserialize is guarded on a present cache), and a
+ *    later successful silent acquire here persists the in-memory cache, recreating the file.
+ */
+export function buildDiskCoherencyCachePlugin(storage: TokenCacheStorage): ICachePlugin {
+  return {
+    beforeCacheAccess: async (context: TokenCacheContext) => {
+      try {
+        const cacheRaw = await storage.load('token-cache');
+        if (cacheRaw) {
+          const pruned = pruneDuplicateRefreshTokens(
+            unwrapCache(cacheRaw).data,
+            context.tokenCache
+          );
+          context.tokenCache.deserialize(pruned.data);
+          dropFromKVStore(context.tokenCache, pruned.dropped);
+        }
+      } catch (error) {
+        logger.error(`Error reloading token cache: ${(error as Error).message}`);
+        if (storage.failClosed) {
+          throw error;
+        }
+      }
+    },
+    afterCacheAccess: async (context: TokenCacheContext) => {
+      if (!context.cacheHasChanged) {
+        return;
+      }
+      try {
+        await storage.save('token-cache', wrapCache(context.tokenCache.serialize()));
+      } catch (error) {
+        logger.error(`Error saving token cache: ${(error as Error).message}`);
+        if (storage.failClosed) {
+          throw error;
+        }
+      }
+    },
+  };
+}
+
 interface ScopeHierarchy {
   [key: string]: string[];
 }
 
 const SCOPE_HIERARCHY: ScopeHierarchy = {
+  'Chat.ReadWrite': ['Chat.Read', 'Chat.ReadBasic'],
+  'Chat.Read': ['Chat.ReadBasic'],
   'Mail.ReadWrite': ['Mail.Read'],
   'Calendars.ReadWrite': ['Calendars.Read'],
   'Files.ReadWrite': ['Files.Read'],
@@ -68,6 +279,7 @@ interface AllowedScopeOptions {
   enabledTools?: string;
   readOnly?: boolean;
   allowedScopes?: string;
+  extraScopes?: string;
 }
 
 interface DisabledToolScope {
@@ -103,23 +315,118 @@ function getEndpointRequiredScopes(
   }
 
   const scopes = new Set<string>();
-  if (endpoint.scopes && Array.isArray(endpoint.scopes)) {
-    endpoint.scopes.forEach((scope) => scopes.add(scope));
-  }
-  if (includeWorkAccountScopes && endpoint.workScopes && Array.isArray(endpoint.workScopes)) {
-    endpoint.workScopes.forEach((scope) => scopes.add(scope));
-  }
+  getEndpointScopeGroups(endpoint, includeWorkAccountScopes).forEach((group) =>
+    group.forEach((scope) => scopes.add(scope))
+  );
   return Array.from(scopes);
+}
+
+/**
+ * Normalizes a scopes/workScopes value into a list of alternative AND-groups.
+ * A flat string[] becomes a single group; a nested string[][] is already groups.
+ */
+function toScopeGroups(value?: string[] | string[][]): string[][] {
+  if (!value || value.length === 0) {
+    return [];
+  }
+  return Array.isArray(value[0]) ? (value as string[][]) : [value as string[]];
+}
+
+/**
+ * Returns the alternative scope groups for an endpoint. The endpoint is satisfied if ALL
+ * scopes in ANY single group are held. scopes and workScopes are mutually exclusive per
+ * endpoints.json validation, so in practice only one side contributes groups.
+ */
+function getEndpointScopeGroups(
+  endpoint: Pick<EndpointConfig, 'scopes' | 'workScopes'> | undefined,
+  includeWorkAccountScopes: boolean = false
+): string[][] {
+  if (!endpoint) {
+    return [];
+  }
+  const groups = [...toScopeGroups(endpoint.scopes)];
+  if (includeWorkAccountScopes) {
+    groups.push(...toScopeGroups(endpoint.workScopes));
+  }
+  return groups;
+}
+
+/**
+ * The scopes to request at login for an endpoint: the primary (first) group only.
+ * Microsoft's guidance is to consent to least-privileged scopes and add higher-privileged
+ * ones on demand, so for OR-group endpoints we request the first group and leave the rest
+ * to --extra-scopes. Flat (single-group) endpoints are unaffected.
+ */
+function getEndpointLoginScopes(
+  endpoint: Pick<EndpointConfig, 'scopes' | 'workScopes'> | undefined,
+  includeWorkAccountScopes: boolean = false
+): string[] {
+  const groups = getEndpointScopeGroups(endpoint, includeWorkAccountScopes);
+  return groups.length > 0 ? groups[0] : [];
+}
+
+/**
+ * Gate check for OR-group endpoints. Returns [] (allowed) if any group is fully covered by
+ * allowedScopes; otherwise the missing scopes of the closest group (fewest missing), for
+ * diagnostics. With a single group this matches getMissingAllowedScopes.
+ */
+function getMissingAllowedScopesForGroups(
+  scopeGroups: string[][],
+  allowedScopes?: string[]
+): string[] {
+  if (allowedScopes === undefined || scopeGroups.length === 0) {
+    return [];
+  }
+  const coveredAllowedScopes = new Set(collapseScopeHierarchy(allowedScopes));
+  let closest: string[] | undefined;
+  for (const group of scopeGroups) {
+    const missing = group.filter((scope) => !coveredAllowedScopes.has(scope));
+    if (missing.length === 0) {
+      return [];
+    }
+    if (!closest || missing.length < closest.length) {
+      closest = missing;
+    }
+  }
+  return closest ?? [];
+}
+
+/**
+ * The scopes actually requested at login for an endpoint, honoring an optional allowlist.
+ *
+ * Without an allowlist this is the primary (first) group, per least-privilege (matches
+ * getEndpointLoginScopes). With an allowlist it is the first group fully covered by the
+ * allowlist, so an OR-group endpoint enabled via a non-primary alternative requests that
+ * alternative's scopes and never scopes outside the allowlist. Returns [] when no group is
+ * satisfied - the same allowlist disables the endpoint in that case (see
+ * getMissingAllowedScopesForGroups), so it contributes no scopes.
+ */
+function getEndpointEffectiveLoginScopes(
+  scopeGroups: string[][],
+  allowedScopes?: string[]
+): string[] {
+  if (scopeGroups.length === 0) {
+    return [];
+  }
+  if (allowedScopes === undefined) {
+    return scopeGroups[0];
+  }
+  const coveredAllowedScopes = new Set(collapseScopeHierarchy(allowedScopes));
+  const satisfied = scopeGroups.find((group) =>
+    group.every((scope) => coveredAllowedScopes.has(scope))
+  );
+  return satisfied ?? [];
 }
 
 function collapseRedundantScopes(scopes: string[]): string[] {
   const scopesSet = new Set(scopes);
 
-  // Scope hierarchy: if we have BOTH a higher scope (ReadWrite) AND lower scopes (Read),
-  // keep only the higher scope since it includes the permissions of the lower scopes.
+  // Scope hierarchy: a higher scope (ReadWrite) includes the permissions of its
+  // lower scopes (Read, ReadBasic), so drop every lower scope that is present -
+  // each on its own, since any subset of them is equally redundant.
   // Do NOT upgrade Read to ReadWrite if we only have Read scopes.
   Object.entries(SCOPE_HIERARCHY).forEach(([higherScope, lowerScopes]) => {
-    if (scopesSet.has(higherScope) && lowerScopes.every((scope) => scopesSet.has(scope))) {
+    if (scopesSet.has(higherScope)) {
       lowerScopes.forEach((scope) => scopesSet.delete(scope));
     }
   });
@@ -165,7 +472,7 @@ function buildScopesFromEndpoints(
       return;
     }
 
-    getEndpointRequiredScopes(endpoint, includeWorkAccountScopes).forEach((scope) =>
+    getEndpointLoginScopes(endpoint, includeWorkAccountScopes).forEach((scope) =>
       scopesSet.add(scope)
     );
   });
@@ -268,6 +575,9 @@ function buildAllowedScopeDiagnostics(options: AllowedScopeOptions = {}): ScopeD
 
   const normalToolScopes = new Set<string>();
   const effectiveToolScopes = new Set<string>();
+  // Union of every group's scopes for passing tools, used only to judge whether an
+  // allowed scope is used by some tool (an OR-group's non-primary scopes still count).
+  const effectiveToolScopesAllGroups = new Set<string>();
   const disabledTools: DisabledToolScope[] = [];
 
   for (const endpoint of endpoints.default) {
@@ -282,20 +592,29 @@ function buildAllowedScopeDiagnostics(options: AllowedScopeOptions = {}): ScopeD
       continue;
     }
 
-    const requiredScopes = getEndpointRequiredScopes(endpoint, Boolean(options.orgMode));
-    requiredScopes.forEach((scope) => normalToolScopes.add(scope));
+    const scopeGroups = getEndpointScopeGroups(endpoint, Boolean(options.orgMode));
+    const loginScopes = getEndpointLoginScopes(endpoint, Boolean(options.orgMode));
+    const allScopes = getEndpointRequiredScopes(endpoint, Boolean(options.orgMode));
+    loginScopes.forEach((scope) => normalToolScopes.add(scope));
 
-    const missingScopes = getMissingAllowedScopes(requiredScopes, allowedScopes);
+    const missingScopes = getMissingAllowedScopesForGroups(scopeGroups, allowedScopes);
     if (missingScopes.length > 0) {
       disabledTools.push({
         toolName: endpoint.toolName,
-        requiredScopes: requiredScopes.sort((a, b) => a.localeCompare(b)),
+        requiredScopes: allScopes.sort((a, b) => a.localeCompare(b)),
         missingScopes: missingScopes.sort((a, b) => a.localeCompare(b)),
       });
       continue;
     }
 
-    requiredScopes.forEach((scope) => effectiveToolScopes.add(scope));
+    // Request the group that actually satisfied the allowlist, not unconditionally the
+    // primary group. For an OR-group endpoint enabled via a non-primary alternative, requesting
+    // the primary group would both leak scopes outside the allowlist and omit the scope the
+    // tool was enabled for. Without an allowlist this is the primary group, unchanged.
+    getEndpointEffectiveLoginScopes(scopeGroups, allowedScopes).forEach((scope) =>
+      effectiveToolScopes.add(scope)
+    );
+    allScopes.forEach((scope) => effectiveToolScopesAllGroups.add(scope));
   }
 
   const toolPermissions = collapseRedundantScopes(Array.from(normalToolScopes)).sort((a, b) =>
@@ -310,8 +629,10 @@ function buildAllowedScopeDiagnostics(options: AllowedScopeOptions = {}): ScopeD
   const missingAllowedScopesForTools = Array.from(
     new Set(disabledTools.flatMap((tool) => tool.missingScopes))
   ).sort((a, b) => a.localeCompare(b));
+  const allEffectiveToolScopes = Array.from(effectiveToolScopesAllGroups);
   const extraAllowedScopesNotUsedByTools =
-    sortedAllowedScopes?.filter((scope) => !isScopeUsedByTools(scope, effectivePermissions)) ?? [];
+    sortedAllowedScopes?.filter((scope) => !isScopeUsedByTools(scope, allEffectiveToolScopes)) ??
+    [];
 
   return {
     permissions: effectivePermissions,
@@ -325,7 +646,16 @@ function buildAllowedScopeDiagnostics(options: AllowedScopeOptions = {}): ScopeD
 }
 
 function resolveAuthScopes(options: AllowedScopeOptions = {}): string[] {
-  return buildAllowedScopeDiagnostics(options).effectivePermissions;
+  const toolScopes = buildAllowedScopeDiagnostics(options).effectivePermissions;
+  // Extra scopes are appended verbatim to the token request, independent of the tool
+  // surface and the allowed-scopes filter. They let a user on their own app registration
+  // request scopes no bundled tool needs (e.g. CopilotPackages.ReadWrite.All) and then
+  // drive the matching endpoints via graph-batch.
+  const extraScopes = parseAllowedScopes(options.extraScopes);
+  if (!extraScopes || extraScopes.length === 0) {
+    return toolScopes;
+  }
+  return Array.from(new Set([...toolScopes, ...extraScopes]));
 }
 
 function buildScopeDiagnostics(
@@ -369,6 +699,75 @@ interface AuthManagerCreateOptions {
   storage?: TokenCacheStorage;
 }
 
+/**
+ * Summarises a silent-acquire failure for logging. MSAL throws AuthError subclasses
+ * (e.g. InteractionRequiredAuthError) whose errorCode, subError and correlationId pin
+ * the cause, such as invalid_grant from the token endpoint or interaction_required.
+ * The log formatter only emits `message`, so the codes are folded into the string here.
+ */
+export function describeAuthError(error: unknown): string {
+  if (error instanceof AuthError) {
+    const suberror = error.subError ? ` / ${error.subError}` : '';
+    return `${error.errorCode}${suberror} (correlationId: ${error.correlationId || 'none'}): ${error.errorMessage}`;
+  }
+  return (error as Error).message;
+}
+
+/**
+ * Hint for a silent refresh that failed while the cache still holds duplicates nothing
+ * could rank.
+ *
+ * The duplicate is logged already, but a stuck user reads `verify login`, not the log. And
+ * the obvious move - log in again - is the one that cannot help: it adds a token next to
+ * the stale one, which still sorts first. Only logout clears it, by deleting the cache
+ * file, and nothing says so anywhere (issue #648).
+ */
+export function duplicateRefreshTokenHint(
+  account: AccountInfo | null | undefined,
+  unresolvedAccounts: ReadonlySet<string>
+): string | null {
+  if (!account || !unresolvedAccounts.has(account.homeAccountId)) {
+    return null;
+  }
+  return (
+    'The auth cache holds more than one refresh token for this account and nothing indicates ' +
+    'which is current, so a stale one may be winning. Logging in again will not clear it - run ' +
+    'logout first, then log in.'
+  );
+}
+
+/** Home tenant id shared by all personal Microsoft accounts (MSA). */
+const MSA_HOME_TENANT_ID = '9188040d-6c67-4c5b-b112-36a304b66dad';
+
+/**
+ * Builds a remediation hint when a personal Microsoft account's refresh token is
+ * rejected on the default 'common' authority. As of June 2026 the token endpoint
+ * returns invalid_grant for MSA refresh tokens issued via /common, while the
+ * same login via /consumers refreshes fine - so the fix is a config change plus
+ * one re-login, which a generic "token may have expired" message does not
+ * convey. Returns null when the failure does not match that signature.
+ */
+export function consumersAuthorityHint(
+  error: unknown,
+  account: AccountInfo | null | undefined,
+  authority: string | undefined
+): string | null {
+  if (
+    error instanceof AuthError &&
+    error.errorCode === 'invalid_grant' &&
+    account?.tenantId === MSA_HOME_TENANT_ID &&
+    (!authority || /\/common\/?$/i.test(authority))
+  ) {
+    return (
+      `This looks like a known issue (June 2026) where Microsoft rejects refresh tokens ` +
+      `issued to personal accounts via the default 'common' authority. If this server is ` +
+      `used only with personal accounts, set MS365_MCP_TENANT_ID=consumers and re-login ` +
+      `with: --login`
+    );
+  }
+  return null;
+}
+
 class AuthManager {
   private config: Configuration;
   private scopes: string[];
@@ -382,6 +781,11 @@ class AuthManager {
   private expectedUsername: string | null;
   private expectedHomeAccountId: string | null;
   private storage: TokenCacheStorage;
+  /**
+   * A sign-in this process could not confirm reached the cache, plus which account it was
+   * about - with several cached, one account's failure must not answer for another (#648).
+   */
+  private loginPersistence: { homeAccountId: string; message: string } | null;
 
   constructor(
     config: Configuration,
@@ -390,18 +794,27 @@ class AuthManager {
     storage?: TokenCacheStorage
   ) {
     logger.info(`And scopes are ${scopes.join(', ')}`, scopes);
-    this.config = config;
     this.scopes = scopes;
+    this.storage = storage ?? new DefaultTokenCacheStorage();
+    // Register a cache plugin so MSAL reloads the newest persisted cache before every access
+    // and persists rotations, keeping concurrent stdio processes coherent (issue #545).
+    this.config = {
+      ...config,
+      cache: {
+        ...config.cache,
+        cachePlugin: buildDiskCoherencyCachePlugin(this.storage),
+      },
+    };
     this.msalApp = new PublicClientApplication(this.config);
     this.accessToken = null;
     this.tokenExpiry = null;
     this.selectedAccountId = null;
     this.useInteractiveAuth = false;
+    this.loginPersistence = null;
     this.expectedUsername = this.normalizeExpectedUsername(expectedAccount?.expectedUsername);
     this.expectedHomeAccountId = this.normalizeExpectedHomeAccountId(
       expectedAccount?.expectedHomeAccountId
     );
-    this.storage = storage ?? new DefaultTokenCacheStorage();
 
     const oauthTokenFromEnv = process.env.MS365_MCP_OAUTH_TOKEN;
     this.oauthToken = oauthTokenFromEnv ?? null;
@@ -429,7 +842,10 @@ class AuthManager {
     try {
       const cacheRaw = await this.storage.load('token-cache');
       if (cacheRaw) {
-        this.msalApp.getTokenCache().deserialize(unwrapCache(cacheRaw).data);
+        const tokenCache = this.msalApp.getTokenCache();
+        const pruned = pruneDuplicateRefreshTokens(unwrapCache(cacheRaw).data, tokenCache);
+        tokenCache.deserialize(pruned.data);
+        dropFromKVStore(tokenCache, pruned.dropped);
       }
 
       // Load selected account
@@ -452,18 +868,6 @@ class AuthManager {
       }
     } catch (error) {
       logger.error(`Error loading selected account: ${(error as Error).message}`);
-      if (this.storage.failClosed) {
-        throw error;
-      }
-    }
-  }
-
-  async saveTokenCache(): Promise<void> {
-    try {
-      const stamped = wrapCache(this.msalApp.getTokenCache().serialize());
-      await this.storage.save('token-cache', stamped);
-    } catch (error) {
-      logger.error(`Error saving token cache: ${(error as Error).message}`);
       if (this.storage.failClosed) {
         throw error;
       }
@@ -607,10 +1011,21 @@ class AuthManager {
     this.tokenExpiry = null;
 
     if (account) {
+      // The cache plugin (afterCacheAccess) persists during the acquire call, so a mismatched
+      // account's tokens are already on disk by the time we get here. removeAccount triggers the
+      // plugin again to persist the removal - but if it fails we must NOT claim the login was not
+      // persisted, because the rejected account's tokens remain in the shared cache. Surface that
+      // loudly and actionably instead of swallowing it (issue #545 hardening).
       try {
         await this.msalApp.getTokenCache().removeAccount(account);
       } catch (error) {
-        logger.warn(`Failed to remove unexpected account from cache: ${(error as Error).message}`);
+        logger.error(`Failed to remove unexpected account from cache: ${(error as Error).message}`);
+        throw new Error(
+          `Authenticated Microsoft account '${this.describeAccount(account)}' does not match expected ` +
+            `Microsoft account '${this.expectedAccountLabel()}', and it could not be removed from the ` +
+            `token cache (${(error as Error).message}). Its tokens may remain persisted - run --logout ` +
+            `to clear the cache, then re-login.`
+        );
       }
       throw new Error(
         `Authenticated Microsoft account '${this.describeAccount(account)}' does not match expected Microsoft account '${this.expectedAccountLabel()}'. Login was not persisted.`
@@ -620,6 +1035,169 @@ class AuthManager {
     throw new Error(
       `Microsoft login did not return an account. Expected Microsoft account '${this.expectedAccountLabel()}'. Login was not persisted.`
     );
+  }
+
+  private async readPersistedRefreshTokens(
+    homeAccountId: string
+  ): Promise<Set<string> | undefined> {
+    const cacheRaw = await this.storage.load('token-cache');
+    return cacheRaw
+      ? persistedRefreshTokens(unwrapCache(cacheRaw).data, homeAccountId)
+      : new Set<string>();
+  }
+
+  /**
+   * The cache as it stood before a sign-in, so the check afterwards can tell a write that
+   * never happened from one a sibling overwrote. The account is not known until the sign-in
+   * returns, so keep the whole blob and filter later. Best-effort.
+   */
+  private async snapshotPersistedCache(): Promise<string | undefined> {
+    try {
+      const cacheRaw = await this.storage.load('token-cache');
+      return cacheRaw ? unwrapCache(cacheRaw).data : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Records why a sign-in could not be confirmed, then throws.
+   *
+   * The message has to outlive the throw. On the MCP `login` path the tool has already
+   * returned - it resolves as soon as there is a device code to show - so this rejection
+   * has nowhere to go, and `verify login` is where the user looks next. Clearing the
+   * in-memory token stops that check from answering out of memory and calling it a
+   * success (issue #648).
+   */
+  private failLoginPersistence(account: AccountInfo, reason: string): never {
+    const message = `Signed in as '${this.describeAccount(account)}', but ${reason}`;
+    this.loginPersistence = { homeAccountId: account.homeAccountId, message };
+    this.accessToken = null;
+    this.tokenExpiry = null;
+    logger.error(message);
+    throw new Error(message);
+  }
+
+  /** Refresh token secrets MSAL holds for an account right now, before anything reloads. */
+  private inMemoryRefreshTokens(homeAccountId: string): Set<string> {
+    const secrets = new Set<string>();
+    const cache = this.msalApp.getTokenCache() as {
+      getKVStore?: () => Record<string, unknown>;
+    };
+    // Absent on a stubbed cache, and on any MSAL that stops exposing it. Returning
+    // nothing turns the check below into a no-op rather than a false alarm.
+    const store = cache.getKVStore?.();
+    if (!store) return secrets;
+
+    for (const entity of Object.values(store)) {
+      if (typeof entity !== 'object' || entity === null) continue;
+      const credential = entity as {
+        credentialType?: string;
+        homeAccountId?: string;
+        secret?: string;
+      };
+      if (credential.credentialType !== 'RefreshToken') continue;
+      if (credential.homeAccountId !== homeAccountId) continue;
+      if (credential.secret) secrets.add(credential.secret);
+    }
+    return secrets;
+  }
+
+  /**
+   * Confirms the refresh token MSAL just issued actually reached the cache.
+   *
+   * Persistence is best-effort by design: DefaultTokenCacheStorage is not fail-closed, so
+   * afterCacheAccess swallows a refused or failed write and the sign-in still reports
+   * success. The account then works for exactly one access token lifetime - the one held
+   * in memory - and every silent refresh afterwards falls back to whatever stale token is
+   * still on disk. Nothing surfaces that until it has been happening for weeks, by which
+   * point the stale token has aged past Entra's 90-day inactivity limit and the account is
+   * dead (issue #648). Cheaper to read the cache back once than to debug that later.
+   *
+   * `before` is the cache ahead of the sign-in. Demanding the issued token on disk is right
+   * until you remember the cache is last-writer-wins, not locked (issue #545): a sibling
+   * mid-refresh can rotate the same credential just after this one saved. That leaves a
+   * live token that isn't ours, which is a working account. The failure is a write that
+   * left no trace at all.
+   */
+  private async assertLoginPersisted(
+    account: AccountInfo | null | undefined,
+    before: string | undefined
+  ): Promise<void> {
+    // A new attempt supersedes whatever the last one concluded.
+    this.loginPersistence = null;
+    if (!account) return;
+
+    // Everything MSAL holds for the account, which after a cache reload is the disk
+    // contents plus whatever this sign-in just added. The whole set has to survive the
+    // write: checking that *some* of it did would be satisfied by the very stale token
+    // this exists to catch, since that one is already on disk.
+    const issued = this.inMemoryRefreshTokens(account.homeAccountId);
+    if (issued.size === 0) return;
+
+    let persisted: Set<string> | undefined;
+    try {
+      persisted = await this.readPersistedRefreshTokens(account.homeAccountId);
+      if (persisted && ![...issued].every((secret) => persisted!.has(secret))) {
+        // The cache is last-writer-wins across processes rather than locked (issue #545),
+        // so this read can land between a sibling's save and its own reload. One more look
+        // is cheaper than telling someone a good sign-in was lost.
+        await delay(PERSISTENCE_RECHECK_MS);
+        persisted = await this.readPersistedRefreshTokens(account.homeAccountId);
+      }
+    } catch (error) {
+      this.failLoginPersistence(
+        account,
+        `the auth cache could not be read back (${(error as Error).message}), so the sign-in cannot ` +
+          `be confirmed as saved. It would stop working when this access token expires. Fix the cache ` +
+          `location, then log in again.`
+      );
+    }
+
+    if (persisted === undefined) {
+      this.failLoginPersistence(
+        account,
+        `the auth cache did not read back as a usable cache, so the sign-in cannot be confirmed as ` +
+          `saved. It would stop working when this access token expires. Check the log for ` +
+          `'Not persisting token-cache'.`
+      );
+    }
+
+    if (![...issued].every((secret) => persisted.has(secret))) {
+      // A secret that is on disk now and wasn't before: someone else wrote a fresh
+      // credential, so the account still works. Has to be an *addition* - a set that merely
+      // differs proves nothing, since a sibling that only pruned a duplicate changes the
+      // set without writing, and the survivor could be the stale token we're hunting.
+      // No snapshot is not an escape hatch either.
+      const beforeSecrets =
+        before === undefined ? undefined : persistedRefreshTokens(before, account.homeAccountId);
+      const supersededByAnotherProcess =
+        beforeSecrets !== undefined && [...persisted].some((secret) => !beforeSecrets.has(secret));
+
+      if (!supersededByAnotherProcess) {
+        this.failLoginPersistence(
+          account,
+          `the refresh token was not written to the auth cache, so access would stop working when this ` +
+            `access token expires. The log says why - look for 'Not persisting token-cache' or ` +
+            `'Error saving token cache'.`
+        );
+      }
+
+      logger.warn(
+        `Another process rewrote the auth cache for '${this.describeAccount(account)}' during sign-in. ` +
+          `The refresh token on disk is not the one just issued, but it was not there before this ` +
+          `sign-in either, so something wrote a live credential and the sign-in counts as saved ` +
+          `(issue #545).`
+      );
+    }
+
+    if (persisted.size > 1) {
+      logger.warn(
+        `The auth cache holds ${persisted.size} refresh tokens for '${this.describeAccount(account)}'. ` +
+          `MSAL spends whichever it finds first, so a stale one can win (issue #648). Log out and sign ` +
+          `in again if silent refresh starts failing.`
+      );
+    }
   }
 
   async setOAuthToken(token: string): Promise<void> {
@@ -648,11 +1226,27 @@ class AuthManager {
         const response = await this.msalApp.acquireTokenSilent(silentRequest);
         this.accessToken = response.accessToken;
         this.tokenExpiry = response.expiresOn ? new Date(response.expiresOn).getTime() : null;
-        await this.saveTokenCache();
+        // Persistence is owned by the cache plugin (afterCacheAccess): when MSAL rotates the
+        // refresh token it reloads-then-saves under the coherency protocol. A manual save here
+        // would serialize the in-memory cache without the reload-before-write step and could
+        // clobber a newer rotation a sibling process wrote in the meantime (issue #545).
         return this.accessToken;
-      } catch {
-        logger.error('Silent token acquisition failed');
-        throw new Error('Silent token acquisition failed');
+      } catch (error) {
+        // Duplicate hint second: the authority one explains the rejection, this one explains
+        // why logging in again won't stick
+        const hint =
+          [
+            consumersAuthorityHint(error, currentAccount, this.config.auth.authority),
+            duplicateRefreshTokenHint(currentAccount, unresolvedDuplicateAccounts),
+          ]
+            .filter(Boolean)
+            .join(' ') || null;
+        logger.error(
+          `Silent token acquisition failed: ${describeAuthError(error)}${hint ? ` ${hint}` : ''}`
+        );
+        throw new Error(
+          hint ? `Silent token acquisition failed. ${hint}` : 'Silent token acquisition failed'
+        );
       }
     }
 
@@ -704,12 +1298,14 @@ class AuthManager {
     try {
       logger.info('Requesting device code...');
       logger.info(`Requesting scopes: ${this.scopes.join(', ')}`);
+      const before = await this.snapshotPersistedCache();
       const response = await this.msalApp.acquireTokenByDeviceCode(deviceCodeRequest);
       logger.info(`Granted scopes: ${response?.scopes?.join(', ') || 'none'}`);
       logger.info('Device code login successful');
       this.accessToken = response?.accessToken || null;
       this.tokenExpiry = response?.expiresOn ? new Date(response.expiresOn).getTime() : null;
       await this.rejectUnexpectedLoginAccount(response?.account);
+      await this.assertLoginPersisted(response?.account, before);
 
       // Set the newly authenticated account as selected if no account is currently selected
       if (!this.selectedAccountId && response?.account) {
@@ -718,7 +1314,8 @@ class AuthManager {
         logger.info(`Auto-selected new account: ${response.account.username}`);
       }
 
-      await this.saveTokenCache();
+      // MSAL persisted the new tokens via the cache plugin (afterCacheAccess) during the
+      // acquire call; no manual save needed (issue #545).
       return this.accessToken;
     } catch (error) {
       logger.error(`Error in device code flow: ${(error as Error).message}`);
@@ -755,12 +1352,14 @@ class AuthManager {
     try {
       logger.info('Requesting interactive browser login...');
       logger.info(`Requesting scopes: ${this.scopes.join(', ')}`);
+      const before = await this.snapshotPersistedCache();
       const response = await this.msalApp.acquireTokenInteractive(interactiveRequest);
       logger.info(`Granted scopes: ${response?.scopes?.join(', ') || 'none'}`);
       logger.info('Interactive browser login successful');
       this.accessToken = response?.accessToken || null;
       this.tokenExpiry = response?.expiresOn ? new Date(response.expiresOn).getTime() : null;
       await this.rejectUnexpectedLoginAccount(response?.account);
+      await this.assertLoginPersisted(response?.account, before);
 
       // Set the newly authenticated account as selected if no account is currently selected
       if (!this.selectedAccountId && response?.account) {
@@ -769,7 +1368,8 @@ class AuthManager {
         logger.info(`Auto-selected new account: ${response.account.username}`);
       }
 
-      await this.saveTokenCache();
+      // MSAL persisted the new tokens via the cache plugin (afterCacheAccess) during the
+      // acquire call; no manual save needed (issue #545).
       return this.accessToken;
     } catch (error) {
       logger.error(`Error in interactive browser flow: ${(error as Error).message}`);
@@ -777,9 +1377,33 @@ class AuthManager {
     }
   }
 
+  /**
+   * Whether the recorded failure is about the account this check would test.
+   *
+   * An explicit selection is the only thing that says "not asking about that sign-in".
+   * Resolving the account is not: a failed sign-in never reaches the auto-select and its
+   * account is usually missing from the cache anyway, so getCurrentAccount falls back to
+   * whichever is first and gives the neighbour a clean bill of health (issue #648).
+   */
+  private loginPersistenceAppliesToCurrentAccount(): boolean {
+    if (!this.loginPersistence) return false;
+    return (
+      this.selectedAccountId === null ||
+      this.selectedAccountId === this.loginPersistence.homeAccountId
+    );
+  }
+
   async testLogin(): Promise<LoginTestResult> {
     try {
       logger.info('Testing login...');
+      // A sign-in whose tokens never reached the cache reports its failure here: on the
+      // MCP login path the tool had already returned by the time that was known, and this
+      // is where the user is told to look next (issue #648).
+      if (this.loginPersistence && this.loginPersistenceAppliesToCurrentAccount()) {
+        logger.error(`Login test failed - ${this.loginPersistence.message}`);
+        return { success: false, message: this.loginPersistence.message };
+      }
+
       const token = await this.getToken();
 
       if (!token) {
@@ -794,8 +1418,7 @@ class AuthManager {
 
       try {
         const secrets = await getSecrets();
-        const cloudEndpoints = getCloudEndpoints(secrets.cloudType);
-        const response = await fetch(`${cloudEndpoints.graphApi}/v1.0/me`, {
+        const response = await fetch(`${getGraphBaseUrl(secrets.cloudType)}/v1.0/me`, {
           headers: {
             Authorization: `Bearer ${token}`,
           },
@@ -845,6 +1468,8 @@ class AuthManager {
       this.accessToken = null;
       this.tokenExpiry = null;
       this.selectedAccountId = null;
+      // Every account is gone, so the recorded failure goes with them (issue #648)
+      this.loginPersistence = null;
 
       await this.storage.delete('token-cache');
       await this.storage.delete('selected-account');
@@ -875,6 +1500,11 @@ class AuthManager {
     // Clear cached tokens to force refresh with new account
     this.accessToken = null;
     this.tokenExpiry = null;
+    // Switching away retires the failure. Switching *to* it keeps it, which is the whole
+    // point of tracking which account it was about
+    if (this.loginPersistence && this.loginPersistence.homeAccountId !== account.homeAccountId) {
+      this.loginPersistence = null;
+    }
 
     logger.info(`Selected account: ${account.username} (${account.homeAccountId})`);
     return true;
@@ -885,6 +1515,12 @@ class AuthManager {
 
     try {
       await this.msalApp.getTokenCache().removeAccount(account);
+
+      // Keyed on the removed account, not the selected one - a failed sign-in never got as
+      // far as auto-selecting itself, so the selection says nothing here (issue #648)
+      if (this.loginPersistence?.homeAccountId === account.homeAccountId) {
+        this.loginPersistence = null;
+      }
 
       // If this was the selected account, clear the selection
       if (this.selectedAccountId === account.homeAccountId) {
@@ -974,6 +1610,16 @@ class AuthManager {
    */
   async getTokenForAccount(identifier?: string): Promise<string> {
     if (this.isOAuthMode && this.oauthToken) {
+      // Refuse instead of silently returning the bearer's identity (discussion #467):
+      // in OAuth mode the token comes from the connecting client and cannot be
+      // switched to a cached MSAL account.
+      if (identifier) {
+        throw new Error(
+          `Cannot switch to account '${identifier}': the server is in OAuth mode and always uses ` +
+            `the identity of the supplied bearer token. Account switching requires stdio mode ` +
+            `(or HTTP with --trust-proxy-auth).`
+        );
+      }
       return this.oauthToken;
     }
 
@@ -1029,12 +1675,16 @@ class AuthManager {
 
     try {
       const response = await this.msalApp.acquireTokenSilent(silentRequest);
-      await this.saveTokenCache();
+      // Persistence is owned by the cache plugin (afterCacheAccess); see getToken (issue #545).
       return response.accessToken;
-    } catch {
+    } catch (error) {
+      const hint = consumersAuthorityHint(error, targetAccount, this.config.auth.authority);
+      logger.error(
+        `Silent token acquisition failed: ${describeAuthError(error)}${hint ? ` ${hint}` : ''}`
+      );
       throw new Error(
         `Failed to acquire token for account '${targetAccount.username || targetAccount.name || 'unknown'}'. ` +
-          `The token may have expired. Please re-login with: --login`
+          (hint ?? 'The token may have expired. Please re-login with: --login')
       );
     }
   }
@@ -1049,7 +1699,9 @@ export {
   buildScopeDiagnostics,
   collapseScopeHierarchy,
   getEndpointRequiredScopes,
+  getEndpointScopeGroups,
   getMissingAllowedScopes,
+  getMissingAllowedScopesForGroups,
   getTokenCachePath,
   getSelectedAccountPath,
   parseAllowedScopes,
