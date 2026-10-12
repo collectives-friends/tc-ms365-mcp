@@ -408,7 +408,7 @@ async function retryErroredItems(
 ): Promise<void> {
   const errored = active.store.itemsByState(driveId, 'error', RETRY_ERROR_ITEMS_PER_RUN);
   for (const item of errored) {
-    if (summary.seen >= options.maxItems || Date.now() > options.deadline) {
+    if (processedWork(summary) >= options.maxItems || Date.now() > options.deadline) {
       summary.moreRemaining = true;
       return;
     }
@@ -766,6 +766,7 @@ export interface SemanticSearchParams {
   pathPrefix?: string;
   topK?: number;
   hybrid?: boolean;
+  minSimilarity?: number;
 }
 
 export interface SemanticSearchHit {
@@ -777,6 +778,7 @@ export interface SemanticSearchHit {
   mime?: string;
   size?: number;
   score: number;
+  similarity?: number;
   snippet: string;
 }
 
@@ -801,10 +803,18 @@ export async function semanticSearch(params: SemanticSearchParams): Promise<Sema
   const fetchSize = filtered ? 200 : Math.max(50, topK * 5);
 
   let vectorRanked: number[] = [];
+  const similarityByRowid = new Map<number, number>();
   if (active.store.vectorEnabled) {
     try {
       const queryVector = await embedQuery(active.embed, params.query);
-      vectorRanked = active.store.vectorSearch(queryVector, fetchSize).map((row) => row.rowid);
+      const vectorRows = active.store.vectorSearch(queryVector, fetchSize);
+      vectorRanked = vectorRows.map((row) => row.rowid);
+      // sqlite-vec reports euclidean distance and the embedding model returns
+      // unit-norm vectors, so cosine similarity is 1 - d²/2.
+      for (const row of vectorRows) {
+        const cosine = 1 - (row.distance * row.distance) / 2;
+        similarityByRowid.set(row.rowid, clamp(cosine, -1, 1));
+      }
     } catch (error) {
       notes.push(`Vector search unavailable (${shortError(error)}); used lexical matching only.`);
     }
@@ -822,18 +832,20 @@ export async function semanticSearch(params: SemanticSearchParams): Promise<Sema
   const rows = active.store.chunksWithItems(ranked.slice(0, topK * 4).map(([rowid]) => rowid));
   const rowsById = new Map(rows.map((row) => [row.rowid, row]));
 
-  const bestByItem = new Map<string, { row: SearchChunkRow; score: number }>();
+  const bestByItem = new Map<string, { row: SearchChunkRow; score: number; similarity?: number }>();
   for (const [rowid, score] of ranked) {
     const row = rowsById.get(rowid);
     if (!row || !matchesFilters(row, params)) continue;
     const current = bestByItem.get(row.itemId);
-    if (!current || score > current.score) bestByItem.set(row.itemId, { row, score });
+    if (!current || score > current.score) {
+      bestByItem.set(row.itemId, { row, score, similarity: similarityByRowid.get(rowid) });
+    }
   }
 
-  const hits = [...bestByItem.values()]
+  let hits: SemanticSearchHit[] = [...bestByItem.values()]
     .sort((a, b) => b.score - a.score)
     .slice(0, topK)
-    .map(({ row, score }) => ({
+    .map(({ row, score, similarity }) => ({
       name: row.name,
       webUrl: row.webUrl,
       path: row.path,
@@ -842,8 +854,21 @@ export async function semanticSearch(params: SemanticSearchParams): Promise<Sema
       mime: row.mime,
       size: row.size,
       score: Number(score.toFixed(6)),
+      ...(similarity !== undefined ? { similarity: Number(similarity.toFixed(4)) } : {}),
       snippet: buildSnippet(row.text, params.query),
     }));
+
+  if (params.minSimilarity !== undefined) {
+    const minSimilarity = clamp(params.minSimilarity, 0, 1);
+    if (hits.every((hit) => hit.similarity === undefined)) {
+      notes.push('minSimilarity was ignored because no vector similarities were available.');
+    } else {
+      const before = hits.length;
+      hits = hits.filter((hit) => hit.similarity !== undefined && hit.similarity >= minSimilarity);
+      const dropped = before - hits.length;
+      if (dropped > 0) notes.push(`${dropped} hit(s) below minSimilarity were dropped.`);
+    }
+  }
 
   if (hits.length === 0) notes.push('No matches.');
   return { hits, notes };
@@ -955,9 +980,14 @@ export async function refreshSearchIndex(
   const dryRun = params.dryRun ?? false;
   const maxMinutes = clamp(Math.round(params.maxMinutes ?? 5), 1, 30);
   const cold = driveIds.some((driveId) => !active.store.getDriveState(driveId)?.deltaLink);
-  const maxItems = cold
-    ? active.config.maxItemsPerRun * COLD_RUN_MULTIPLIER
-    : active.config.maxItemsPerRun;
+  // The item budget bounds real work (downloads, extraction, embeddings). A
+  // dry-run only walks metadata, so it runs unbounded and the time budget
+  // alone stops it; the survey then covers the whole drive in one call.
+  const maxItems = dryRun
+    ? Number.POSITIVE_INFINITY
+    : cold
+      ? active.config.maxItemsPerRun * COLD_RUN_MULTIPLIER
+      : active.config.maxItemsPerRun;
 
   active.syncing = true;
   try {

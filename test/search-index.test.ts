@@ -180,7 +180,18 @@ function oneHot(index: number): number[] {
 }
 
 function embeddingFor(text: string): number[] {
-  return text.toLowerCase().includes('alpha') ? oneHot(0) : oneHot(1);
+  const lower = text.toLowerCase();
+  if (lower.includes('alpha')) return oneHot(0);
+  if (lower.includes('gamma')) return diagonalVector();
+  return oneHot(1);
+}
+
+/** Unit vector at 45° to oneHot(0): cosine 0.7071, euclidean distance 0.7654. */
+function diagonalVector(): number[] {
+  const vector = new Array<number>(TEST_DIMS).fill(0);
+  vector[0] = Math.SQRT1_2;
+  vector[1] = Math.SQRT1_2;
+  return vector;
 }
 
 // Structural stand-in for RequestInit: eslint's node globals do not define the
@@ -687,13 +698,18 @@ describe.skipIf(!sqliteAvailable)('index runtime with fake Graph and embeddings'
     expect(fourth.drives[0].unchanged).toBe(44);
   });
 
-  it('counts without writing on dryRun', async () => {
+  it('counts without writing on dryRun and walks past the item budget', async () => {
+    // The item budget bounds real work only; the survey must still cover the
+    // whole drive in a single call.
+    env.MS365_MCP_INDEX_MAX_ITEMS_PER_RUN = '1';
     extraItems.push(deltaFile('item-budget', 'budget.xlsx', XLSX_MIME));
     await initSearchIndex(deps, env);
     const result = await refreshSearchIndex(deps, { dryRun: true, full: true });
 
     const summary = result.drives[0];
     expect(result.mode).toBe('dry-run');
+    expect(summary.moreRemaining).toBe(false);
+    expect(summary.folders).toBe(1);
     expect(summary.survey?.byKind.text?.files).toBe(1);
     expect(summary.survey?.byKind.xlsx?.files).toBe(1);
     expect(summary.survey?.unsupported.files).toBe(1);
@@ -701,6 +717,42 @@ describe.skipIf(!sqliteAvailable)('index runtime with fake Graph and embeddings'
     expect(status.documents).toBe(0);
     expect(status.chunks).toBe(0);
     expect(status.driveStates.length).toBe(0);
+  });
+
+  it('exposes cosine similarity per hit and filters on minSimilarity', async () => {
+    extraItems.push(
+      deltaFile('item-beta', 'beta.txt', 'text/plain'),
+      deltaFile('item-gamma', 'gamma.txt', 'text/plain')
+    );
+    files.set('item-beta', {
+      id: 'item-beta',
+      name: 'beta.txt',
+      mime: 'text/plain',
+      bytes: Buffer.from('Beta uden nøgleordet', 'utf8'),
+    });
+    files.set('item-gamma', {
+      id: 'item-gamma',
+      name: 'gamma.txt',
+      mime: 'text/plain',
+      bytes: Buffer.from('Gamma indhold i dokumentet', 'utf8'),
+    });
+    await initSearchIndex(deps, env);
+    await refreshSearchIndex(deps, {});
+
+    // The fake embeddings are unit vectors at 0°, 45° and 90° to the query, so
+    // the reported similarity must recover 1, cos 45° and 0 from the distance.
+    const all = await semanticSearch({ query: 'Alpha', topK: 5 });
+    const byName = new Map(all.hits.map((hit) => [hit.name, hit]));
+    expect(byName.get('notes.txt')?.similarity).toBeCloseTo(1, 3);
+    expect(byName.get('gamma.txt')?.similarity).toBeCloseTo(Math.SQRT1_2, 3);
+    expect(byName.get('beta.txt')?.similarity).toBeCloseTo(0, 3);
+
+    const filtered = await semanticSearch({ query: 'Alpha', topK: 5, minSimilarity: 0.6 });
+    expect(filtered.hits.map((hit) => hit.name)).toEqual(['notes.txt', 'gamma.txt']);
+    expect(filtered.notes.join(' ')).toMatch(/below minSimilarity/);
+
+    const strict = await semanticSearch({ query: 'Alpha', topK: 5, minSimilarity: 0.9 });
+    expect(strict.hits.map((hit) => hit.name)).toEqual(['notes.txt']);
   });
 
   it('records per-item errors and retries them on the next run', async () => {

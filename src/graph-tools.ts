@@ -2107,7 +2107,7 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
     searchKeywords:
       'semantic search meaning based search find document by topic natural language search knowledge index similarity search document search',
     description:
-      'Search the indexed content of the shared SharePoint drive(s) by meaning rather than by file name: use it when the user describes a document by topic ("the supplier contract about hosting", "budget for next year") instead of naming the file. Returns ranked hits with { name, webUrl, path, driveId, lastModified, mime, size, score, snippet }; snippet is a short excerpt of the matched text and webUrl is the browser link for citing the document. Follow up with extract-document-text on a hit to read the full document. The index covers Word, Excel, PowerPoint, PDF and plain-text documents and the server refreshes it every few minutes; refresh-search-index updates it immediately.',
+      'Search the indexed content of the shared SharePoint drive(s) by meaning rather than by file name: use it when the user describes a document by topic ("the supplier contract about hosting", "budget for next year") instead of naming the file. Returns ranked hits with { name, webUrl, path, driveId, lastModified, mime, size, score, similarity?, snippet }; score is a relative ranking score, similarity is the cosine similarity of the best-matching chunk (1 = closest, only present when vector search ranked it), snippet is a short excerpt of the matched text and webUrl is the browser link for citing the document. Hits are ranked, not filtered: set minSimilarity to drop weak matches, or judge them from similarity and the snippet. Follow up with extract-document-text on a hit to read the full document. The index covers Word, Excel, PowerPoint, PDF and plain-text documents and the server refreshes it every few minutes; refresh-search-index updates it immediately.',
     readOnlyHint: true,
     openWorldHint: true,
     buildSchema: () => ({
@@ -2138,9 +2138,18 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
         .describe(
           'Combine meaning and keyword ranking (default true). Set false to rank by meaning only.'
         ),
+      minSimilarity: z
+        .number()
+        .min(0)
+        .max(1)
+        .optional()
+        .describe(
+          'Drop hits whose cosine similarity is below this value (0-1); only applies when vector search is available. Useful to keep only confident matches, e.g. for a topic that may not be in the index.'
+        ),
     }),
     execute: async (params) => {
       try {
+        const started = Date.now();
         const query = String(params.query ?? '').trim();
         const result = await semanticSearch({
           query,
@@ -2148,10 +2157,13 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
           pathPrefix: typeof params.pathPrefix === 'string' ? params.pathPrefix : undefined,
           topK: typeof params.topK === 'number' ? params.topK : undefined,
           hybrid: typeof params.hybrid === 'boolean' ? params.hybrid : undefined,
+          minSimilarity:
+            typeof params.minSimilarity === 'number' ? params.minSimilarity : undefined,
         });
         const payload = JSON.stringify({
           query,
           hitCount: result.hits.length,
+          tookMs: Date.now() - started,
           ...(result.notes.length > 0 ? { notes: result.notes } : {}),
           hits: result.hits,
         });
@@ -2174,7 +2186,7 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
     searchKeywords:
       'refresh search index update search index sync search index reindex rebuild index index documents',
     description:
-      'Bring the semantic search index up to date from Microsoft Graph. Read-only on the Microsoft side: it downloads document content and writes the local index only. Without arguments it applies the deltas since the last run for every configured drive; full: true rebuilds a drive from scratch; dryRun: true only counts what would be indexed (files by type and bytes) without downloading or writing anything. Returns per-drive counts (seen, folders, indexed, unchanged, skipped, deleted, errors) and moreRemaining, which is true when a run stopped at its budget (run again to continue).',
+      'Bring the semantic search index up to date from Microsoft Graph. Read-only on the Microsoft side: it downloads document content and writes the local index only. Without arguments it applies the deltas since the last run for every configured drive; full: true rebuilds a drive from scratch; dryRun: true only counts what would be indexed (files by type and bytes) without downloading or writing anything — it walks the whole drive in one call and is bounded by maxMinutes, not by the item budget. Returns per-drive counts (seen, folders, indexed, unchanged, skipped, deleted, errors) and moreRemaining, which is true when a run stopped at its budget (run again to continue).',
     readOnlyHint: false,
     openWorldHint: true,
     buildSchema: () => ({
