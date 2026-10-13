@@ -39,6 +39,12 @@ import {
   TicketStoreFullError,
 } from './lib/attachment-tickets.js';
 import { buildBM25Index, scoreQuery, tokenize, type BM25Index } from './lib/bm25.js';
+import {
+  getAppOnlyCalendarToken,
+  isAppOnlyCalendarEnabled,
+  isCalendarToolPath,
+  rewriteCalendarPath,
+} from './lib/app-only-calendar.js';
 import { isDestructiveOperation } from './lib/destructive-ops.js';
 import {
   CONFIRM_PARAM_DESCRIPTION,
@@ -2781,7 +2787,51 @@ async function executeGraphTool(
 
     const parameterDefinitions = tool.parameters || [];
 
-    let path = tool.path;
+    // App-only calendar: an application token has no /me mailbox, so calendar
+    // calls are rewritten to the organizer's mailbox (`calendarUser`) and
+    // authenticated as the app. No silent fallback: a missing user or a failed
+    // token request must not write to the agent account's own calendar.
+    let appOnlyTargetPath: string | undefined;
+    if (isAppOnlyCalendarEnabled() && isCalendarToolPath(tool.path)) {
+      const requested = typeof params.calendarUser === 'string' ? params.calendarUser.trim() : '';
+      delete params.calendarUser;
+      if (tool.path.startsWith('/me/')) {
+        if (!requested) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({
+                  error: 'calendar_user_required',
+                  message:
+                    'Pass calendarUser (the organizer UPN) with calendar tools; the app-only token has no /me mailbox.',
+                }),
+              },
+            ],
+            isError: true,
+          };
+        }
+        appOnlyTargetPath = rewriteCalendarPath(tool.path, requested);
+      }
+      try {
+        accountAccessToken = await getAppOnlyCalendarToken();
+      } catch (err) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                error: 'app_only_calendar_token_failed',
+                message: (err as Error).message,
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+
+    let path = appOnlyTargetPath ?? tool.path;
     const queryParams: Record<string, string> = {};
     const headers: Record<string, string> = {};
 
