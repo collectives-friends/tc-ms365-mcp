@@ -695,6 +695,8 @@ When running as an MCP server, the following options can be used:
 --http-local-file-tools Register download-bytes-to-file over HTTP. Anyone who can reach the port
                   can write files as the server's user (without a valid token, only an empty
                   file that is removed again), so enable it only on a single-user machine.
+                  With MS365_MCP_UPLOAD_DIRS set it also registers upload-attachment-from-file,
+                  which reads files from those directories.
                   Refused unless --http binds a loopback host with no --public-url and no
                   --trust-proxy-auth
 --enable-auth-tools Enable login/logout tools when using HTTP mode (disabled by default in HTTP mode)
@@ -713,6 +715,8 @@ When running as an MCP server, the following options can be used:
 --preset <names>  Use preset tool categories (comma-separated). See "Tool Presets" section above
 --list-presets    List all available presets and exit
 --toon            (experimental) Enable TOON output format for 30-60% token reduction
+--blob-output     File download tools answer an MCP EmbeddedResource with the file instead of
+                  base64 JSON in a text block (see MS365_MCP_BLOB_OUTPUT below)
 --discovery       Dynamic tool discovery: loads tools on demand to reduce initial token usage (see "Dynamic Tool Discovery" above)
 --public-url <url> Public base URL for OAuth when behind a reverse proxy (see Open WebUI section and docs/deployment.md)
 ```
@@ -728,6 +732,8 @@ Environment variables:
 - `MS365_MCP_MAX_PAGES=<n>`: Maximum number of pages followed when a tool is called with `fetchAllPages: true` (positive integer, default `100`). Bounds memory and latency for large result sets.
 - `MS365_MCP_MAX_ITEMS=<n>`: Maximum number of items accumulated when `fetchAllPages: true` (positive integer, default `10000`). Pagination stops and the response is truncated once this many items are collected.
 - `MS365_MCP_ALLOW_PAGINATION=0|false|no`: Disable multi-page following entirely. When set, the `fetchAllPages` parameter is not advertised on tools, and any request that still passes it returns only the first page (default: pagination enabled).
+- `MS365_MCP_BLOB_OUTPUT=true|1`: File download tools (`download-bytes`, `get-mail-message-mime`, `get-shared-mailbox-message-mime`, `get-mail-attachment-content`, `get-shared-mailbox-attachment-content`) answer a short JSON text block (`name`, `contentType`, `size`) and an MCP `EmbeddedResource` with `BlobResourceContents` (`uri`, `mimeType`, `blob`) instead of base64 JSON in text. The `uri`'s last segment is the optional `fileName` argument. Default: off. Alternative to the --blob-output flag.
+- `MS365_MCP_BLOB_MAX_BYTES=<n>`: With blob output on, the largest file a download tool reads (positive integer, default `5242880`). The server stops reading past it and answers an error naming the limit.
 - `MS365_MCP_BODY_FORMAT=html`: Return email bodies as HTML instead of plain text (default: text)
 - `MS365_MCP_MESSAGE_SIGNOFF_PREFIX=<text>`: Signoff prepended to outgoing messages so recipients can tell they were agent-sent, e.g. `🤖`. Default: none. CLI equivalent: `--message-signoff-prefix <text>` (see Message Signoff below)
 - `MS365_MCP_MESSAGE_SIGNOFF_SUFFIX=<text>`: Signoff appended to outgoing messages. Default: none. CLI equivalent: `--message-signoff-suffix <text>`. `--no-message-signoff` disables both (see Message Signoff below)
@@ -735,7 +741,8 @@ Environment variables:
 - `MS365_MCP_TRUST_PROXY_HOPS=<n>`: Number of trusted reverse-proxy hops in HTTP mode (default `1`). Accurate per-IP rate limiting depends on this matching your deployment — set to the number of proxies in front of the server, `0` to use the raw socket peer IP, or a comma-separated subnet list
 - `MS365_MCP_ATTACHMENT_PORT=<port>`: Serve the attachment route on its own listener on this port (alternative to --attachment-port; requires `--enable-attachment-urls`)
 - `MS365_MCP_ATTACHMENT_HOST=<host>`: Interface the `MS365_MCP_ATTACHMENT_PORT` listener binds (alternative to --attachment-host; requires `--attachment-port`). Defaults to the host `--http` bound — which for a wildcard `--http` means both ports answer everywhere and the port split isolates nothing. See "Splitting the attachment listener"
-- `MS365_MCP_HTTP_LOCAL_FILE_TOOLS=true|1`: Register download-bytes-to-file over HTTP (alternative to --http-local-file-tools; same restrictions)
+- `MS365_MCP_HTTP_LOCAL_FILE_TOOLS=true|1`: Register download-bytes-to-file, and upload-attachment-from-file when `MS365_MCP_UPLOAD_DIRS` is set, over HTTP (alternative to --http-local-file-tools; same restrictions)
+- `MS365_MCP_UPLOAD_DIRS=<dirs>`: Directories `upload-attachment-from-file` may read from, as absolute paths separated like `PATH`. Unset (the default) leaves the tool unregistered. See "Attaching a local file in stdio mode"
 - `MS365_MCP_CLOUD_TYPE=global|china`: Microsoft cloud environment (alternative to --cloud flag)
 - `MS365_MCP_GRAPH_BASE_URL=<url>`: Send Graph API requests to this base URL instead of the cloud's `graph.microsoft.com` (e.g. `http://127.0.0.1:10255/tenant-a/graph` for an egress proxy that originates TLS itself). Absolute http(s) URL without query or fragment; a path prefix is kept, so requests go to `<url>/v1.0/...`. The login authority and the On-Behalf-Of token resource are unchanged. Two things bypass it: `get-download-url` returns Graph's pre-authenticated SharePoint URL, and the `302` from `/content` points straight at SharePoint, so whoever follows either connects to SharePoint directly; if you control egress, allow those SharePoint hosts or disable those tools. Not read from `.env`
 - `LOG_LEVEL`: Set logging level (default: 'info')
@@ -804,6 +811,26 @@ through an upload session in 3.75 MiB chunks, so the server never holds more tha
 whatever the outcome, and the upload is attached as the identity that minted it, exactly as
 downloads are fetched. An upload ticket presented to `GET` (or a download ticket to `PUT`)
 is refused with the same 404 as any other bad ticket.
+
+### Attaching a local file in stdio mode
+
+In stdio mode the server and the files are on the same machine, so no URL is needed.
+`upload-attachment-from-file` takes the same `target` and an absolute `filePath`, reads the
+file from disk and attaches it, with the same 3 MB and 150 MB limits. It is the upload
+counterpart of `download-bytes-to-file`.
+
+The tool is off until you list the directories it may read from:
+
+```
+MS365_MCP_UPLOAD_DIRS=/Users/me/Documents/invitations:/Users/me/Scans
+```
+
+Entries are absolute paths, separated like `PATH` (`:` on macOS and Linux, `;` on Windows).
+A file outside them is refused, and symlinks are resolved first, so a link inside an allowed
+directory cannot point the read somewhere else. The variable is not read from `.env`.
+
+Over HTTP the tool is registered only with `--http-local-file-tools`, like
+`download-bytes-to-file`.
 
 ### Configuration
 

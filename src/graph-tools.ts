@@ -28,9 +28,10 @@ import AuthManager, {
 } from './auth.js';
 import { api as betaApi } from './generated/client-beta.js';
 import { api } from './generated/client.js';
-import GraphClient from './graph-client.js';
+import GraphClient, { getBlobMaxBytes, isBlobOutputEnabled } from './graph-client.js';
 import { getAttachmentMinting } from './lib/attachment-minting.js';
-import { MAX_UPLOAD_BYTES } from './attachment-route.js';
+import { MAX_UPLOAD_BYTES, uploadAttachment } from './lib/attachment-upload.js';
+import { getUploadDirs, openUploadFile, type UploadFile } from './lib/upload-dirs.js';
 import {
   buildAttachmentUrl,
   isPlainGraphPath,
@@ -108,6 +109,9 @@ interface EndpointConfig {
   skipEncoding?: string[]; // Parameter names that should NOT be URL-encoded (for function-style API calls)
   contentType?: string;
   acceptType?: string; // Custom Accept header for endpoints returning non-JSON content (e.g., text/vtt)
+  // A file download. With MS365_MCP_BLOB_OUTPUT on, the tool answers a short JSON text block
+  // plus an MCP blob resource (capped by MS365_MCP_BLOB_MAX_BYTES); it takes an optional fileName.
+  blobOutput?: boolean;
   readOnly?: boolean; // When true, allow this endpoint in read-only mode even if method is not GET
   presets?: string[]; // Presets this endpoint belongs to (mail, outlook, personal, ...)
   // JSON Schema for the request body of an endpoint that Microsoft has NOT published
@@ -883,9 +887,11 @@ interface UtilityTool {
   execute: (params: Record<string, unknown>, ctx: UtilityToolContext) => Promise<CallToolResult>;
   readOnlyHint?: boolean;
   openWorldHint?: boolean;
-  // When true, this tool writes to the server's local filesystem and is only
+  // When true, this tool reads or writes the server's local filesystem and is only
   // registered in stdio mode, or over HTTP with --http-local-file-tools.
   stdioOnly?: boolean;
+  // Registered only while this returns true, for a tool that needs operator opt-in.
+  enabled?: () => boolean;
 }
 
 interface DisabledToolScope {
@@ -972,6 +978,7 @@ function collectDeniedToolPolicies(options: {
   for (const utility of UTILITY_TOOLS) {
     if (options.readOnly && !utility.readOnlyHint) continue;
     if (options.httpMode && utility.stdioOnly) continue;
+    if (utility.enabled && !utility.enabled()) continue;
     if (options.enabledToolsRegex && !options.enabledToolsRegex.test(utility.name)) {
       deniedTools.set(utility.name, {
         toolName: utility.name,
@@ -1082,8 +1089,21 @@ async function checkAccountParamInBearerMode(
 const UPLOAD_TARGET = /^(\/me|\/users\/[^/]+)\/(messages|events)\/[^/]+\/attachments$/;
 const UPLOAD_CONTENT_TYPE = /^[\w.+-]+\/[\w.+-]+$/;
 
+const UPLOAD_TARGET_ERROR =
+  'target must be the attachments collection of a draft message or an event: /me/messages/{message-id}/attachments or /me/events/{event-id}/attachments.';
+
 function uploadError(message: string): CallToolResult {
   return { content: [{ type: 'text', text: JSON.stringify({ error: message }) }], isError: true };
+}
+
+function cleanAttachmentName(name: string): string {
+  return Array.from(name.trim())
+    .filter((char) => {
+      const code = char.charCodeAt(0);
+      return code > 0x1f && code !== 0x7f;
+    })
+    .join('')
+    .slice(0, 255);
 }
 
 /**
@@ -1111,17 +1131,9 @@ async function mintUploadUrl(
     );
   }
   if (!UPLOAD_TARGET.test(target) || !isPlainGraphPath(target)) {
-    return uploadError(
-      'target must be the attachments collection of a draft message or an event: /me/messages/{message-id}/attachments or /me/events/{event-id}/attachments.'
-    );
+    return uploadError(UPLOAD_TARGET_ERROR);
   }
-  const cleanName = Array.from(name.trim())
-    .filter((char) => {
-      const code = char.charCodeAt(0);
-      return code > 0x1f && code !== 0x7f;
-    })
-    .join('')
-    .slice(0, 255);
+  const cleanName = cleanAttachmentName(name);
   if (!cleanName) return uploadError('name is required.');
   if (!UPLOAD_CONTENT_TYPE.test(contentType)) {
     return uploadError('contentType must be a MIME type such as application/pdf.');
@@ -1333,6 +1345,132 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
     },
   },
   {
+    name: 'upload-attachment-from-file',
+    method: 'POST',
+    path: 'tool:upload-attachment-from-file',
+    searchKeywords:
+      'attach local file upload file from disk attach file path draft email attach file event attachment without base64',
+    description:
+      'Attach a local file on the server to a draft message or an event, read straight from disk instead of passing as base64 through the agent context. target is the attachments collection, e.g. /me/messages/{message-id}/attachments or /me/events/{event-id}/attachments. Files up to 150 MB; the server picks an inline upload or an upload session by size. filePath must be absolute and inside a directory listed in MS365_MCP_UPLOAD_DIRS. stdio mode, or HTTP with --http-local-file-tools.',
+    readOnlyHint: false,
+    openWorldHint: true,
+    stdioOnly: true,
+    enabled: () => getUploadDirs().length > 0,
+    buildSchema: (ctx) => {
+      const schema: Record<string, z.ZodTypeAny> = {
+        target: z
+          .string()
+          .describe(
+            'Attachments collection of a draft message or an event, e.g. /me/messages/{message-id}/attachments or /me/events/{event-id}/attachments.'
+          ),
+        filePath: z
+          .string()
+          .describe(
+            "Absolute path of the file on the server's filesystem, e.g. /Users/me/documents/invitation.pdf. Must be inside a directory the server allows uploads from."
+          ),
+        name: z
+          .string()
+          .optional()
+          .describe(
+            'Attachment file name as the recipient will see it. Defaults to the file name of filePath.'
+          ),
+        contentType: z
+          .string()
+          .optional()
+          .describe(
+            'MIME type of the file, e.g. application/pdf. Defaults to application/octet-stream.'
+          ),
+      };
+      if (ctx.multiAccount) {
+        schema['account'] = z
+          .string()
+          .optional()
+          .describe(
+            'Account to use when multiple Microsoft accounts are configured. Required when multiple accounts exist (see list-accounts).'
+          );
+      }
+      return schema;
+    },
+    execute: async (params, { graphClient, authManager }) => {
+      const target = params.target;
+      const filePath = params.filePath;
+      const accountParam = params.account as string | undefined;
+      if (typeof target !== 'string' || target.length === 0) {
+        return uploadError('target is required and must be a non-empty string.');
+      }
+      if (typeof filePath !== 'string' || filePath.length === 0) {
+        return uploadError('filePath is required and must be a non-empty string.');
+      }
+      if (!UPLOAD_TARGET.test(target) || !isPlainGraphPath(target)) {
+        return uploadError(UPLOAD_TARGET_ERROR);
+      }
+      const contentType =
+        typeof params.contentType === 'string' && params.contentType.length > 0
+          ? params.contentType
+          : 'application/octet-stream';
+      if (!UPLOAD_CONTENT_TYPE.test(contentType)) {
+        return uploadError('contentType must be a MIME type such as application/pdf.');
+      }
+      const name = cleanAttachmentName(
+        typeof params.name === 'string' && params.name.trim().length > 0
+          ? params.name
+          : path.basename(filePath)
+      );
+      if (!name) return uploadError('name is required.');
+
+      let file: UploadFile;
+      try {
+        file = await openUploadFile(filePath, getUploadDirs());
+      } catch (error) {
+        return uploadError((error as Error).message);
+      }
+      try {
+        if (file.size === 0) return uploadError('The file is empty.');
+        if (file.size > MAX_UPLOAD_BYTES) {
+          return uploadError(
+            `The file is ${file.size} bytes; the largest attachment is ${MAX_UPLOAD_BYTES} bytes.`
+          );
+        }
+        const accountModeError = await checkAccountParamInBearerMode(accountParam, authManager);
+        if (accountModeError) return uploadError(accountModeError);
+        let accountAccessToken: string | undefined;
+        if (authManager && !authManager.isOAuthModeEnabled() && !getRequestTokens()) {
+          accountAccessToken = await authManager.getTokenForAccount(accountParam);
+        }
+        const created = await uploadAttachment(
+          graphClient,
+          { target, name, contentType, size: file.size, accessToken: accountAccessToken },
+          // end pins the read to the size that was declared, should the file grow meanwhile
+          file.handle.createReadStream({
+            autoClose: false,
+            highWaterMark: 1024 * 1024,
+            end: file.size - 1,
+          })
+        );
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                name,
+                size: file.size,
+                ...(created.id ? { id: created.id } : {}),
+              }),
+            },
+          ],
+        };
+      } catch (error) {
+        const metadata = thrownErrorAuditFields(error);
+        return {
+          ...uploadError((error as Error).message),
+          ...(Object.keys(metadata).length > 0 ? { _meta: metadata } : {}),
+        };
+      } finally {
+        await file.handle.close();
+      }
+    },
+  },
+  {
     name: 'parse-teams-url',
     method: 'POST',
     path: 'tool:parse-teams-url',
@@ -1367,7 +1505,7 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
     method: 'GET',
     path: 'tool:download-bytes',
     description:
-      'Download binary content from Microsoft Graph and return it as base64. Single tool for any binary read: drive file content, mail attachment, profile photo, Teams hosted content, meeting recording. Returns { contentType, encoding: "base64", contentLength, contentBytes }. For large drive/SharePoint file content, prefer get-download-url, which returns a pre-authenticated URL to stream bytes out-of-band instead of base64 through the agent context.',
+      'Download binary content from Microsoft Graph and return it as base64. Single tool for any binary read: drive file content, mail attachment, profile photo, Teams hosted content, meeting recording. Returns { contentType, encoding: "base64", contentLength, contentBytes }. For large drive/SharePoint file content, prefer get-download-url, which returns a pre-authenticated URL to stream bytes out-of-band instead of base64 through the agent context. With the server\'s blob output on, the bytes come back as a file resource instead (capped by the server\'s download limit); pass fileName to name it.',
     readOnlyHint: true,
     openWorldHint: true,
     buildSchema: (ctx) => {
@@ -1383,6 +1521,12 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
               '/teams/{team-id}/channels/{channel-id}/messages/{chatMessage-id}/hostedContents/{chatMessageHostedContent-id}/$value (Teams channel hosted content). ' +
               'For meeting recordings, use get-meeting-recording-content where available; Microsoft Graph returns authenticated recording bytes, not a pre-authenticated download URL.'
           ),
+        fileName: z
+          .string()
+          .describe(
+            'Name of the file, used as the last segment of the returned resource URI when the server runs with blob output. Optional.'
+          )
+          .optional(),
       };
       if (ctx.multiAccount) {
         schema['account'] = z
@@ -1445,10 +1589,21 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
         // decoded as UTF-8 text with every invalid sequence replaced by U+FFFD —
         // unrecoverable. rawResponse is kept for the JSON-body case (issue #546) but
         // is not reached while forceBinary is set.
+        // With blob output on, the same bytes come back as a file resource, capped like
+        // the typed file tools.
+        const blob = isBlobOutputEnabled()
+          ? {
+              maxBytes: getBlobMaxBytes(),
+              blobOutput: {
+                fileName: typeof params.fileName === 'string' ? params.fileName : undefined,
+              },
+            }
+          : {};
         return await graphClient.graphRequest(target, {
           accessToken: accountAccessToken,
           rawResponse: true,
           forceBinary: true,
+          ...blob,
         });
       } catch (error) {
         return {
@@ -2638,6 +2793,7 @@ async function executeGraphTool(
     const strayBodyFields: Record<string, unknown> = {};
 
     for (const [paramName, paramValue] of Object.entries(params)) {
+      if (paramName === 'fileName' && config?.blobOutput) continue;
       // Skip control parameters - not part of the Microsoft Graph API
       if (
         [
@@ -3010,10 +3166,21 @@ async function executeGraphTool(
       accessToken?: string;
       apiVersion?: string;
       forceJsonOutput?: boolean;
+      forceBinary?: boolean;
+      maxBytes?: number;
+      blobOutput?: { fileName?: string };
     } = {
       method: tool.method.toUpperCase(),
       headers,
     };
+
+    if (config?.blobOutput && isBlobOutputEnabled()) {
+      options.forceBinary = true;
+      options.maxBytes = getBlobMaxBytes();
+      options.blobOutput = {
+        fileName: typeof params.fileName === 'string' ? params.fileName : undefined,
+      };
+    }
 
     // Route beta-flagged endpoints to the /beta surface; everything else stays on v1.0.
     if (config?.apiVersion) {
@@ -3317,10 +3484,11 @@ async function executeGraphTool(
     }
 
     // Convert McpResponse to CallToolResult with the correct structure
-    const content: ContentItem[] = response.content.map((item) => ({
-      type: 'text' as const,
-      text: item.text,
-    }));
+    const content: ContentItem[] = response.content.map((item) =>
+      (item as { type: string }).type === 'resource'
+        ? (item as unknown as ResourceContent)
+        : { type: 'text' as const, text: item.text }
+    );
 
     auditLog({
       event: 'tool.call',
@@ -3503,6 +3671,15 @@ export function registerGraphTools(
         .optional();
     }
 
+    if (endpointConfig?.blobOutput && paramSchema['fileName'] === undefined) {
+      paramSchema['fileName'] = z
+        .string()
+        .describe(
+          'Name of the file, used as the last segment of the returned resource URI when the server runs with blob output. Optional.'
+        )
+        .optional();
+    }
+
     if (isFetchAllPagesApplicable(tool)) {
       const maxPages = getMaxPages();
       paramSchema['fetchAllPages'] = z
@@ -3623,6 +3800,7 @@ export function registerGraphTools(
   for (const utility of UTILITY_TOOLS) {
     if (readOnly && !utility.readOnlyHint) continue;
     if (httpMode && utility.stdioOnly) continue;
+    if (utility.enabled && !utility.enabled()) continue;
     if (enabledToolsRegex && !enabledToolsRegex.test(utility.name)) continue;
     try {
       registerUtilityToolWithMcp(server, utility, utilityCtx);
@@ -3842,6 +4020,7 @@ export function registerDiscoveryTools(
   const utilityTools = UTILITY_TOOLS.filter((u) => {
     if (readOnly && !u.readOnlyHint) return false;
     if (httpMode && u.stdioOnly) return false;
+    if (u.enabled && !u.enabled()) return false;
     if (enabledToolsRegex && !enabledToolsRegex.test(u.name)) return false;
     return true;
   });

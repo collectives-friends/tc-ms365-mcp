@@ -949,7 +949,39 @@
     "presets": ["mail", "outlook", "personal"],
     "scopes": ["Mail.Read"],
     "acceptType": "text/plain",
+    "blobOutput": true,
     "llmTip": "Download an email message as raw RFC 5322 MIME content (.eml format). Use this when archiving an email to disk preserving all original headers, body, and inline-encoded attachments. Returns the MIME stream as text. Find the message id with list-mail-messages first."
+  },
+  {
+    "pathPattern": "/users/{user-id}/messages/{message-id}/$value",
+    "method": "get",
+    "toolName": "get-shared-mailbox-message-mime",
+    "descriptionOverride": "Download the raw MIME source (RFC 5322 .eml content) of a message in another user's mailbox or a shared mailbox, by message ID. The user-id is the mailbox owner's ID or email address, and delegated access to that mailbox is required.",
+    "presets": ["work"],
+    "workScopes": ["Mail.Read.Shared"],
+    "acceptType": "text/plain",
+    "blobOutput": true,
+    "llmTip": "Download a message of a shared mailbox as an .eml. Find the message id with list-shared-mailbox-messages first. With the server's blob output on, the bytes come back as a file resource; pass fileName to name it."
+  },
+  {
+    "pathPattern": "/me/messages/{message-id}/attachments/{attachment-id}/$value",
+    "method": "get",
+    "toolName": "get-mail-attachment-content",
+    "descriptionOverride": "Download the raw bytes of a file attachment of an Outlook message in the signed-in user's mailbox, by message ID and attachment ID.",
+    "presets": ["mail", "outlook", "personal"],
+    "scopes": ["Mail.Read"],
+    "blobOutput": true,
+    "llmTip": "Find the attachment id with list-mail-attachments first. With the server's blob output on, the bytes come back as a file resource; pass fileName (the attachment's name) to name it. Files over the server's download limit are refused with an error naming the limit."
+  },
+  {
+    "pathPattern": "/users/{user-id}/messages/{message-id}/attachments/{attachment-id}/$value",
+    "method": "get",
+    "toolName": "get-shared-mailbox-attachment-content",
+    "descriptionOverride": "Download the raw bytes of a file attachment of a message in another user's mailbox or a shared mailbox, by message ID and attachment ID. The user-id is the mailbox owner's ID or email address, and delegated access to that mailbox is required.",
+    "presets": ["work"],
+    "workScopes": ["Mail.Read.Shared"],
+    "blobOutput": true,
+    "llmTip": "Find the attachment id with list-shared-mailbox-attachments first. With the server's blob output on, the bytes come back as a file resource; pass fileName (the attachment's name) to name it. Files over the server's download limit are refused with an error naming the limit."
   },
   {
     "pathPattern": "/drives/{drive-id}/items/{driveItem-id}/workbook/worksheets/{workbookWorksheet-id}/range(address='{address}')",
@@ -1322,7 +1354,7 @@
     "toolName": "create-todo-task",
     "presets": ["personal", "tasks"],
     "scopes": ["Tasks.ReadWrite"],
-    "llmTip": "Creates a new task in a Microsoft To Do list. Body: { title: \"...\" }; optional dueDateTime, reminderDateTime, importance, body (notes), recurrence, categories. Requires todoTaskListId from list-todo-task-lists."
+    "llmTip": "Creates a new task in a Microsoft To Do list. Body: { title: \"...\" }; optional dueDateTime, reminderDateTime, importance, body (notes), recurrence, categories, and checklistItems: [{ displayName: \"...\", isChecked: false }] to create the task's steps inline (isChecked is optional). Requires todoTaskListId from list-todo-task-lists. To change steps after the task exists, use the *-todo-checklist-item tools."
   },
   {
     "pathPattern": "/me/todo/lists/{todoTaskList-id}/tasks/{todoTask-id}",
@@ -1330,7 +1362,7 @@
     "toolName": "update-todo-task",
     "presets": ["personal", "tasks"],
     "scopes": ["Tasks.ReadWrite"],
-    "llmTip": "Updates a Microsoft To Do task. Use this to mark a to-do item complete or done (body: { status: \"completed\" }), reopen it (status: \"notStarted\"), rename it (title), or change its due date (dueDateTime), reminder (reminderDateTime), importance, or notes (body). Requires todoTaskListId from list-todo-task-lists and todoTaskId from list-todo-tasks."
+    "llmTip": "Updates a Microsoft To Do task. Use this to mark a to-do item complete or done (body: { status: \"completed\" }), reopen it (status: \"notStarted\"), rename it (title), or change its due date (dueDateTime), reminder (reminderDateTime), importance, or notes (body). Requires todoTaskListId from list-todo-task-lists and todoTaskId from list-todo-tasks. Steps (checklistItems) can't be changed here: Graph rejects checklistItems in a PATCH on the task with 400. Use create-todo-checklist-item, update-todo-checklist-item, or delete-todo-checklist-item instead."
   },
   {
     "pathPattern": "/me/todo/lists/{todoTaskList-id}/tasks/{todoTask-id}",
@@ -1362,6 +1394,38 @@
     "presets": ["personal", "tasks"],
     "scopes": ["Tasks.ReadWrite"],
     "llmTip": "Removes a linked resource from a To Do task."
+  },
+  {
+    "pathPattern": "/me/todo/lists/{todoTaskList-id}/tasks/{todoTask-id}/checklistItems",
+    "method": "get",
+    "toolName": "list-todo-checklist-items",
+    "presets": ["personal", "tasks"],
+    "scopes": ["Tasks.Read"],
+    "llmTip": "Lists the steps (checklist items) of a To Do task. Each item has id, displayName, isChecked, checkedDateTime, and createdDateTime. Graph supports no OData query parameters on this endpoint, so do not pass select, filter, orderby, or top. Requires todoTaskListId from list-todo-task-lists and todoTaskId from list-todo-tasks."
+  },
+  {
+    "pathPattern": "/me/todo/lists/{todoTaskList-id}/tasks/{todoTask-id}/checklistItems",
+    "method": "post",
+    "toolName": "create-todo-checklist-item",
+    "presets": ["personal", "tasks"],
+    "scopes": ["Tasks.ReadWrite"],
+    "llmTip": "Adds a step (checklist item) to an existing To Do task. Body: { displayName: \"...\" }; optional isChecked (defaults to false). Returns the new item with its id. To add steps while creating a task, pass checklistItems in the create-todo-task body instead."
+  },
+  {
+    "pathPattern": "/me/todo/lists/{todoTaskList-id}/tasks/{todoTask-id}/checklistItems/{checklistItem-id}",
+    "method": "patch",
+    "toolName": "update-todo-checklist-item",
+    "presets": ["personal", "tasks"],
+    "scopes": ["Tasks.ReadWrite"],
+    "llmTip": "Updates a step (checklist item) of a To Do task. Use this to check a step off (body: { isChecked: true }), uncheck it (isChecked: false), or rename it (displayName). Requires checklistItemId from list-todo-checklist-items."
+  },
+  {
+    "pathPattern": "/me/todo/lists/{todoTaskList-id}/tasks/{todoTask-id}/checklistItems/{checklistItem-id}",
+    "method": "delete",
+    "toolName": "delete-todo-checklist-item",
+    "presets": ["personal", "tasks"],
+    "scopes": ["Tasks.ReadWrite"],
+    "llmTip": "Deletes a step (checklist item) from a To Do task. This cannot be undone. Requires checklistItemId from list-todo-checklist-items."
   },
   {
     "pathPattern": "/me/planner/tasks",

@@ -3,6 +3,7 @@ import { readFileSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { assertSignoffMarkersVisible } from './lib/message-signoff.js';
+import { assertUploadDirsAbsolute } from './lib/upload-dirs.js';
 import { getCombinedPresetPattern, listPresets, presetRequiresOrgMode } from './tool-categories.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -118,7 +119,11 @@ program
   )
   .option(
     '--http-local-file-tools',
-    "In HTTP mode, also register download-bytes-to-file, which writes files on the server as the server's user. Anyone who can reach the port can use it, so enable only on a single-user machine. Refused unless --http binds a loopback host with no --public-url and no --trust-proxy-auth."
+    "In HTTP mode, also register the local file tools: download-bytes-to-file, which writes files on the server as the server's user, and upload-attachment-from-file, which reads files from the MS365_MCP_UPLOAD_DIRS directories when that is set. Anyone who can reach the port can use them, so enable only on a single-user machine. Refused unless --http binds a loopback host with no --public-url and no --trust-proxy-auth."
+  )
+  .option(
+    '--blob-output',
+    'File download tools (get-mail-message-mime, get-shared-mailbox-message-mime, get-mail-attachment-content, get-shared-mailbox-attachment-content) answer an MCP EmbeddedResource with the file instead of base64 JSON in a text block. Off by default.'
   )
   .option(
     '--allow-unauthenticated-discovery',
@@ -180,6 +185,7 @@ export interface CommandOptions {
   obo?: boolean;
   trustProxyAuth?: boolean;
   httpLocalFileTools?: boolean;
+  blobOutput?: boolean;
   allowUnauthenticatedDiscovery?: boolean;
   publicUrl?: string;
   /** @deprecated use publicUrl */
@@ -203,9 +209,14 @@ export function parseArgs(): CommandOptions {
     process.env.MS365_MCP_MESSAGE_SIGNOFF_SUFFIX = '';
     process.env.MS365_MCP_MESSAGE_SIGNOFF_PREFIX = '';
   }
+  // Same for blob output, which graph-client.ts reads per download
+  if (options.blobOutput) {
+    process.env.MS365_MCP_BLOB_OUTPUT = 'true';
+  }
   // Markup in a marker is allowed (e.g. a coloured <span>), but refuse to start
   // with one that renders as empty text - html sends would look unsigned.
   assertSignoffMarkersVisible();
+  assertUploadDirsAbsolute();
 
   if (options.listPresets) {
     const presets = listPresets();
