@@ -1,4 +1,17 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import { fileURLToPath } from 'url';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import JSZip from 'jszip';
 import { z } from 'zod';
 
 /**
@@ -6,18 +19,30 @@ import { z } from 'zod';
  * Strategy: mock GraphClient, create a real McpServer, register tools, then invoke them.
  */
 
+const loggerMock = vi.hoisted(() => ({
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
+  debug: vi.fn(),
+}));
+
 // Mock logger to silence output
 vi.mock('../logger.js', () => ({
-  default: {
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-    debug: vi.fn(),
-  },
+  default: loggerMock,
 }));
+
+const auditLogMock = vi.hoisted(() => vi.fn());
+vi.mock('../audit-log.js', async () => {
+  const actual = await vi.importActual<typeof import('../audit-log.js')>('../audit-log.js');
+  return {
+    ...actual,
+    auditLog: auditLogMock,
+  };
+});
 
 // Mock the generated client — we supply our own endpoint definitions per test
 const mockEndpoints: any[] = [];
+vi.mock('../generated/client-beta.js', () => ({ api: { endpoints: [] } }));
 vi.mock('../generated/client.js', () => ({
   api: {
     get endpoints() {
@@ -60,6 +85,7 @@ function makeEndpoint(overrides: Partial<any> = {}) {
       { name: 'search', type: 'Query', schema: z.string().optional() },
       { name: 'select', type: 'Query', schema: z.string().optional() },
       { name: 'orderby', type: 'Query', schema: z.string().optional() },
+      { name: 'expand', type: 'Query', schema: z.string().optional() },
       { name: 'count', type: 'Query', schema: z.boolean().optional() },
       { name: 'top', type: 'Query', schema: z.number().optional() },
       { name: 'skip', type: 'Query', schema: z.number().optional() },
@@ -80,7 +106,7 @@ function makeConfig(overrides: Partial<any> = {}) {
 }
 
 /** Creates a mock GraphClient with a controllable graphRequest spy */
-function createMockGraphClient(responses?: any[]) {
+function createMockGraphClient(responses?: any[], outputFormat: 'json' | 'toon' = 'json') {
   const responseQueue = [...(responses || [])];
   return {
     graphRequest: vi.fn().mockImplementation(async () => {
@@ -91,6 +117,13 @@ function createMockGraphClient(responses?: any[]) {
         content: [{ type: 'text', text: JSON.stringify({ value: [] }) }],
       };
     }),
+    // Fake serialize: prefix the JSON in toon mode so a test can tell the merged
+    // body went through serialize() and not a plain JSON.stringify.
+    serialize: vi
+      .fn()
+      .mockImplementation((data: unknown) =>
+        outputFormat === 'toon' ? `TOON:${JSON.stringify(data)}` : JSON.stringify(data)
+      ),
   };
 }
 
@@ -111,7 +144,29 @@ function createMockServer() {
     string,
     { description: string; schema: any; handler: (...args: any[]) => any }
   >();
+  const requestHandlers = new Map<string, (request: unknown, extra: unknown) => Promise<unknown>>();
+  const installDefaultToolCallHandler = () => {
+    if (requestHandlers.has('tools/call')) return;
+    requestHandlers.set('tools/call', async (request: unknown) => {
+      const params = (request as { params?: { name?: string; arguments?: unknown } }).params;
+      const toolName = params?.name ?? 'unknown';
+      const tool = tools.get(toolName);
+      if (!tool) {
+        throw new Error(`Tool ${toolName} not found`);
+      }
+      return tool.handler(params?.arguments ?? {});
+    });
+  };
+  const lowLevelServer = {
+    _requestHandlers: requestHandlers,
+    setRequestHandler: vi.fn(
+      (_schema: unknown, handler: (request: unknown, extra: unknown) => Promise<unknown>) => {
+        requestHandlers.set('tools/call', handler);
+      }
+    ),
+  };
   return {
+    server: lowLevelServer,
     tool: vi.fn(
       (
         name: string,
@@ -121,10 +176,31 @@ function createMockServer() {
         handler: (...args: any[]) => any
       ) => {
         tools.set(name, { description, schema, handler });
+        installDefaultToolCallHandler();
+      }
+    ),
+    registerTool: vi.fn(
+      (
+        name: string,
+        config: { description: string; inputSchema: any },
+        handler: (...args: any[]) => any
+      ) => {
+        // Expose the zod object's shape so tests can keep asserting on params
+        tools.set(name, {
+          description: config.description,
+          schema: config.inputSchema?.shape ?? config.inputSchema,
+          handler,
+        });
+        installDefaultToolCallHandler();
       }
     ),
     tools,
   };
+}
+
+function makeJwt(payload: Record<string, unknown>): string {
+  const body = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  return `header.${body}.signature`;
 }
 
 // ========== TESTS ==========
@@ -134,6 +210,892 @@ describe('graph-tools', () => {
     mockEndpoints.length = 0;
     mockEndpointsJson = [];
     vi.clearAllMocks();
+  });
+
+  // ---- 0. Audit outcome metadata ----
+  describe('audit outcome metadata', () => {
+    it('includes HTTP status on successful Graph tool calls', async () => {
+      const endpoint = makeEndpoint();
+      const config = makeConfig();
+      mockEndpoints.push(endpoint);
+      mockEndpointsJson = [config];
+
+      const graphClient = createMockGraphClient([
+        {
+          content: [{ type: 'text', text: JSON.stringify({ value: [] }) }],
+          _meta: { http_status: 200 },
+        },
+      ]);
+
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(
+        server as unknown as Parameters<typeof registerGraphTools>[0],
+        graphClient as unknown as Parameters<typeof registerGraphTools>[1]
+      );
+
+      await server.tools.get('test-tool')!.handler({});
+
+      expect(auditLogMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'tool.call',
+          tool: 'test-tool',
+          status: 'success',
+          http_status: 200,
+        })
+      );
+    });
+
+    it('includes HTTP status and Graph error code on failed Graph tool calls', async () => {
+      const endpoint = makeEndpoint();
+      const config = makeConfig();
+      mockEndpoints.push(endpoint);
+      mockEndpointsJson = [config];
+
+      const graphClient = createMockGraphClient([
+        {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({ error: 'Microsoft Graph API error: 403 Forbidden' }),
+            },
+          ],
+          isError: true,
+          _meta: { http_status: 403, error_code: 'accessDenied' },
+        },
+      ]);
+
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      await server.tools.get('test-tool')!.handler({});
+
+      expect(auditLogMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'tool.call',
+          tool: 'test-tool',
+          status: 'error',
+          http_status: 403,
+          error_code: 'accessDenied',
+        })
+      );
+    });
+
+    it('includes HTTP status on utility tool calls that reach Graph', async () => {
+      mockEndpoints.length = 0;
+      mockEndpointsJson = [];
+
+      const graphClient = {
+        graphRequest: vi.fn().mockResolvedValue({
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                contentType: 'image/jpeg',
+                encoding: 'base64',
+                contentBytes: 'aGk=',
+              }),
+            },
+          ],
+          _meta: { http_status: 200 },
+        }),
+      };
+
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      await server.tools.get('download-bytes')!.handler({ target: '/me/photo/$value' });
+
+      expect(auditLogMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'tool.call',
+          tool: 'download-bytes',
+          status: 'success',
+          http_method: 'GET',
+          http_status: 200,
+        })
+      );
+    });
+
+    it('includes HTTP status and Graph error code on failed utility Graph calls', async () => {
+      mockEndpoints.length = 0;
+      mockEndpointsJson = [];
+
+      const graphClient = {
+        graphRequest: vi.fn().mockResolvedValue({
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({ error: 'Microsoft Graph API error: 403 Forbidden' }),
+            },
+          ],
+          isError: true,
+          _meta: { http_status: 403, error_code: 'accessDenied' },
+        }),
+      };
+
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      await server.tools.get('download-bytes')!.handler({ target: '/me/photo/$value' });
+
+      expect(auditLogMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'tool.call',
+          tool: 'download-bytes',
+          status: 'error',
+          http_status: 403,
+          error_code: 'accessDenied',
+        })
+      );
+    });
+
+    it('copies Graph batch outcome metadata into audit events', async () => {
+      const endpoint = makeEndpoint({
+        method: 'post',
+        path: '/$batch',
+        alias: 'graph-batch',
+        parameters: [{ name: 'body', type: 'Body', schema: z.object({}).passthrough() }],
+      });
+      const config = makeConfig({
+        pathPattern: '/$batch',
+        method: 'post',
+        toolName: 'graph-batch',
+      });
+      mockEndpoints.push(endpoint);
+      mockEndpointsJson = [config];
+
+      const graphClient = createMockGraphClient([
+        {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                responses: [
+                  { id: '1', status: 200, body: { id: 'message-1' } },
+                  {
+                    id: '2',
+                    status: 403,
+                    body: { error: { code: 'accessDenied', message: 'Access denied' } },
+                  },
+                ],
+              }),
+            },
+          ],
+          _meta: {
+            http_status: 200,
+            graph_batch_subrequest_count: 2,
+            graph_batch_http_status_counts: { '200': 1, '403': 1 },
+            graph_batch_error_code_counts: { accessDenied: 1 },
+          },
+        },
+      ]);
+
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(
+        server as unknown as Parameters<typeof registerGraphTools>[0],
+        graphClient as unknown as Parameters<typeof registerGraphTools>[1]
+      );
+
+      await server.tools.get('graph-batch')!.handler({
+        body: { requests: [{ id: '1', method: 'GET', url: '/me' }] },
+      });
+
+      expect(auditLogMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'tool.call',
+          tool: 'graph-batch',
+          status: 'success',
+          http_status: 200,
+          graph_batch_subrequest_count: 2,
+          graph_batch_http_status_counts: { '200': 1, '403': 1 },
+          graph_batch_error_code_counts: { accessDenied: 1 },
+        })
+      );
+    });
+  });
+
+  describe('audit response volume', () => {
+    it('lifts result volume from _meta onto the audit event', async () => {
+      const endpoint = makeEndpoint({
+        method: 'get',
+        path: '/me/messages',
+        alias: 'list-mail-messages',
+      });
+      const config = makeConfig({
+        pathPattern: '/me/messages',
+        method: 'get',
+        toolName: 'list-mail-messages',
+      });
+      mockEndpoints.push(endpoint);
+      mockEndpointsJson = [config];
+
+      const graphClient = createMockGraphClient([
+        {
+          content: [{ type: 'text', text: JSON.stringify({ value: [{ id: 'm1' }] }) }],
+          _meta: {
+            http_status: 200,
+            result_count: 4821,
+            result_has_more: true,
+            response_bytes: 8_412_004,
+          },
+        },
+      ]);
+
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(
+        server as unknown as Parameters<typeof registerGraphTools>[0],
+        graphClient as unknown as Parameters<typeof registerGraphTools>[1]
+      );
+
+      await server.tools.get('list-mail-messages')!.handler({});
+
+      expect(auditLogMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          tool: 'list-mail-messages',
+          status: 'success',
+          result_count: 4821,
+          result_has_more: true,
+          response_bytes: 8_412_004,
+        })
+      );
+    });
+
+    it('keeps result_has_more when it is false rather than dropping it', async () => {
+      const endpoint = makeEndpoint({
+        method: 'get',
+        path: '/me/messages',
+        alias: 'list-mail-messages',
+      });
+      const config = makeConfig({
+        pathPattern: '/me/messages',
+        method: 'get',
+        toolName: 'list-mail-messages',
+      });
+      mockEndpoints.push(endpoint);
+      mockEndpointsJson = [config];
+
+      const graphClient = createMockGraphClient([
+        {
+          content: [{ type: 'text', text: JSON.stringify({ value: [] }) }],
+          _meta: { http_status: 200, result_count: 0, result_has_more: false },
+        },
+      ]);
+
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(
+        server as unknown as Parameters<typeof registerGraphTools>[0],
+        graphClient as unknown as Parameters<typeof registerGraphTools>[1]
+      );
+
+      await server.tools.get('list-mail-messages')!.handler({});
+
+      const [payload] = auditLogMock.mock.calls[0];
+      expect(payload.result_count).toBe(0);
+      expect(payload.result_has_more).toBe(false);
+    });
+
+    it('restates count and bytes for the whole read when pages are merged', async () => {
+      mockEndpoints.push(makeEndpoint());
+      mockEndpointsJson = [makeConfig()];
+
+      const graphClient = createMockGraphClient([
+        {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                value: [{ id: '1' }, { id: '2' }],
+                '@odata.nextLink': 'https://graph.microsoft.com/v1.0/me/messages?$skip=2',
+              }),
+            },
+          ],
+          _meta: { http_status: 200, result_count: 2, result_has_more: true, response_bytes: 1000 },
+        },
+        {
+          content: [{ type: 'text', text: JSON.stringify({ value: [{ id: '3' }] }) }],
+          _meta: { http_status: 200, result_count: 1, result_has_more: false, response_bytes: 700 },
+        },
+      ]);
+
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      await server.tools.get('test-tool')!.handler({ fetchAllPages: true });
+
+      const [payload] = auditLogMock.mock.calls[0];
+      expect(payload.result_count).toBe(3);
+      expect(payload.result_has_more).toBe(false);
+      // Both pages, not just page one — the whole point of merging.
+      expect(payload.response_bytes).toBe(1700);
+    });
+
+    it('reports result_has_more when the merge loop stopped on a page cap', async () => {
+      const prevMaxPages = process.env.MS365_MCP_MAX_PAGES;
+      process.env.MS365_MCP_MAX_PAGES = '2';
+      try {
+        mockEndpoints.push(makeEndpoint());
+        mockEndpointsJson = [makeConfig()];
+
+        // Every page carries a nextLink, so the loop can only exit on the cap.
+        const graphClient = createMockGraphClient(
+          Array.from({ length: 5 }, (_, i) => ({
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({
+                  value: [{ id: `item-${i}` }],
+                  '@odata.nextLink': `https://graph.microsoft.com/v1.0/me/messages?$skip=${i + 1}`,
+                }),
+              },
+            ],
+            _meta: { http_status: 200, result_count: 1, result_has_more: true, response_bytes: 50 },
+          }))
+        );
+
+        const server = createMockServer();
+        const { registerGraphTools } = await loadModule();
+        registerGraphTools(server as any, graphClient as any);
+
+        const result = await server.tools.get('test-tool')!.handler({ fetchAllPages: true });
+
+        const [payload] = auditLogMock.mock.calls[0];
+        expect(payload.result_count).toBe(2);
+        // Truncated at the cap: the merged body drops @odata.nextLink, so the
+        // audit event is the only place Graph-has-more survives.
+        expect(JSON.parse(result.content[0].text)['@odata.nextLink']).toBeUndefined();
+        expect(payload.result_has_more).toBe(true);
+        expect(payload.response_bytes).toBe(100);
+      } finally {
+        if (prevMaxPages === undefined) {
+          delete process.env.MS365_MCP_MAX_PAGES;
+        } else {
+          process.env.MS365_MCP_MAX_PAGES = prevMaxPages;
+        }
+      }
+    });
+
+    it('reports result_has_more when a page is not a collection', async () => {
+      mockEndpoints.push(makeEndpoint());
+      mockEndpointsJson = [makeConfig()];
+
+      const pageThreeLink = 'https://graph.microsoft.com/v1.0/me/messages?$skip=4';
+      // Page three came back as bytes rather than a collection, which is what the client
+      // returns for a body that is not valid UTF-8 (#679). It cannot be merged; the risk
+      // is reporting the short list as the whole list.
+      const graphClient = createMockGraphClient([
+        {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                value: [{ id: '1' }, { id: '2' }],
+                '@odata.nextLink': 'https://graph.microsoft.com/v1.0/me/messages?$skip=2',
+              }),
+            },
+          ],
+          _meta: { http_status: 200, result_count: 2, result_has_more: true, response_bytes: 1000 },
+        },
+        {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                value: [{ id: '3' }, { id: '4' }],
+                '@odata.nextLink': pageThreeLink,
+              }),
+            },
+          ],
+          _meta: { http_status: 200, result_count: 2, result_has_more: true, response_bytes: 900 },
+        },
+        {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                message: 'OK!',
+                contentType: 'application/json',
+                encoding: 'base64',
+                contentLength: 9,
+                contentBytes: 'eyJ2YWx1',
+              }),
+            },
+          ],
+          _meta: { http_status: 200, response_bytes: 700 },
+        },
+      ]);
+
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      const result = await server.tools.get('test-tool')!.handler({ fetchAllPages: true });
+
+      // Page one alone would satisfy a has-more check, so pin that all three were asked for.
+      expect(graphClient.graphRequest).toHaveBeenCalledTimes(3);
+
+      const body = JSON.parse(result.content[0].text);
+      expect(body.value.map((item: { id: string }) => item.id)).toEqual(['1', '2', '3', '4']);
+      // The caller reads the body, not the audit event, and needs the link to resume.
+      expect(body['@odata.nextLink']).toBe(pageThreeLink);
+
+      const [payload] = auditLogMock.mock.calls[0];
+      expect(payload.result_count).toBe(4);
+      // The unmergeable page must not read as the end of the collection.
+      expect(payload.result_has_more).toBe(true);
+      // Its bytes never reached the caller, so they are not part of the total.
+      expect(payload.response_bytes).toBe(1900);
+    });
+
+    it('omits the volume fields when the client supplied none', async () => {
+      const endpoint = makeEndpoint({ method: 'get', path: '/me', alias: 'get-current-user' });
+      const config = makeConfig({
+        pathPattern: '/me',
+        method: 'get',
+        toolName: 'get-current-user',
+      });
+      mockEndpoints.push(endpoint);
+      mockEndpointsJson = [config];
+
+      const graphClient = createMockGraphClient([
+        {
+          content: [{ type: 'text', text: JSON.stringify({ id: 'user-1' }) }],
+          _meta: { http_status: 200 },
+        },
+      ]);
+
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(
+        server as unknown as Parameters<typeof registerGraphTools>[0],
+        graphClient as unknown as Parameters<typeof registerGraphTools>[1]
+      );
+
+      await server.tools.get('get-current-user')!.handler({});
+
+      const [payload] = auditLogMock.mock.calls[0];
+      expect(payload).not.toHaveProperty('result_count');
+      expect(payload).not.toHaveProperty('result_has_more');
+      expect(payload).not.toHaveProperty('response_bytes');
+    });
+  });
+
+  describe('audit recipient metadata', () => {
+    const draftEndpoint = () => {
+      const endpoint = makeEndpoint({
+        method: 'post',
+        path: '/me/messages',
+        alias: 'create-draft-email',
+        parameters: [{ name: 'body', type: 'Body', schema: z.object({}).passthrough() }],
+      });
+      const config = makeConfig({
+        pathPattern: '/me/messages',
+        method: 'post',
+        toolName: 'create-draft-email',
+      });
+      mockEndpoints.push(endpoint);
+      mockEndpointsJson = [config];
+    };
+
+    const runDraft = async (body: unknown) => {
+      const graphClient = createMockGraphClient([
+        {
+          content: [{ type: 'text', text: JSON.stringify({ id: 'draft-1' }) }],
+          _meta: { http_status: 201 },
+        },
+      ]);
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(
+        server as unknown as Parameters<typeof registerGraphTools>[0],
+        graphClient as unknown as Parameters<typeof registerGraphTools>[1]
+      );
+      await server.tools.get('create-draft-email')!.handler({ body });
+      return auditLogMock.mock.calls[0][0];
+    };
+
+    it('records recipient count and domains, deduplicated and sorted', async () => {
+      draftEndpoint();
+      const payload = await runDraft({
+        toRecipients: [
+          { emailAddress: { address: 'someone@example.com' } },
+          { emailAddress: { address: 'Another@Example.com' } },
+        ],
+        ccRecipients: [{ emailAddress: { address: 'auditor@partner.co.uk' } }],
+      });
+
+      expect(payload).toMatchObject({
+        tool: 'create-draft-email',
+        recipient_count: 3,
+        recipient_domains: ['example.com', 'partner.co.uk'],
+      });
+    });
+
+    it('reads recipients nested under a camelCase message, as createReply sends them', async () => {
+      draftEndpoint();
+      const payload = await runDraft({
+        comment: 'forwarding this on',
+        message: { toRecipients: [{ emailAddress: { address: 'outside@gmail.com' } }] },
+      });
+
+      expect(payload).toMatchObject({ recipient_count: 1, recipient_domains: ['gmail.com'] });
+    });
+
+    it('reads PascalCase fields, as the Graph action endpoints send them', async () => {
+      draftEndpoint();
+      // POST /me/messages/{id}/forward and /me/sendMail use ToRecipients / Message,
+      // unlike POST /me/messages which uses toRecipients.
+      const payload = await runDraft({
+        Comment: 'fyi',
+        ToRecipients: [{ emailAddress: { address: 'partner@vendor.com' } }],
+        Message: { CcRecipients: [{ emailAddress: { address: 'watcher@vendor.com' } }] },
+      });
+
+      expect(payload).toMatchObject({ recipient_count: 2, recipient_domains: ['vendor.com'] });
+    });
+
+    it('records calendar attendees, not just mail recipients', async () => {
+      draftEndpoint();
+      const payload = await runDraft({
+        subject: 'sync',
+        attendees: [
+          { emailAddress: { address: 'colleague@example.com' }, type: 'required' },
+          { emailAddress: { address: 'guest@external.org' }, type: 'optional' },
+        ],
+      });
+
+      expect(payload).toMatchObject({
+        recipient_count: 2,
+        recipient_domains: ['example.com', 'external.org'],
+      });
+    });
+
+    it('logs domains only, never the local part of an address', async () => {
+      draftEndpoint();
+      const payload = await runDraft({
+        toRecipients: [{ emailAddress: { address: 'confidential.name@example.com' } }],
+      });
+
+      expect(payload.recipient_domains).toEqual(['example.com']);
+      expect(JSON.stringify(payload)).not.toContain('confidential.name');
+    });
+
+    it('rejects a tail that is not a plain hostname', async () => {
+      draftEndpoint();
+      const payload = await runDraft({
+        toRecipients: [
+          { emailAddress: { address: 'a@example.com/path' } },
+          { emailAddress: { address: 'b@evil<script' } },
+          { emailAddress: { address: 'c@example.com,comment' } },
+          { emailAddress: { address: 'd@[IPv6:2001:db8::1]' } },
+          { emailAddress: { address: 'e@good.example' } },
+        ],
+      });
+
+      expect(payload.recipient_count).toBe(5);
+      expect(payload.recipient_domains).toEqual(['good.example']);
+    });
+
+    it('drops a domain longer than a hostname can be', async () => {
+      draftEndpoint();
+      const payload = await runDraft({
+        toRecipients: [
+          { emailAddress: { address: `a@${'x'.repeat(300)}.example` } },
+          { emailAddress: { address: 'b@ext.com' } },
+        ],
+      });
+
+      // The cap bounds how many domains land in a record, not how long each one is, so
+      // without a length check one address picks the size of the audit line
+      expect(payload.recipient_count).toBe(2);
+      expect(payload.recipient_domains).toEqual(['ext.com']);
+    });
+
+    it('counts an entry that names someone without an address', async () => {
+      draftEndpoint();
+      const payload = await runDraft({
+        recipients: [{ alias: 'finance-team' }, { objectId: 'abc-123' }],
+      });
+
+      expect(payload.recipient_count).toBe(2);
+      expect(payload).not.toHaveProperty('recipient_domains');
+    });
+
+    it('walks a body forwarded to Graph as a raw JSON string', async () => {
+      // Needs a strict schema: a passthrough one wraps the string instead, so the
+      // raw-string path never fires. When both parses fail, real mail goes out.
+      mockEndpoints.push(
+        makeEndpoint({
+          method: 'post',
+          path: '/me/sendMail',
+          alias: 'send-mail',
+          parameters: [
+            {
+              name: 'body',
+              type: 'Body',
+              schema: z.object({ message: z.object({}).passthrough() }),
+            },
+          ],
+        })
+      );
+      mockEndpointsJson = [
+        makeConfig({ pathPattern: '/me/sendMail', method: 'post', toolName: 'send-mail' }),
+      ];
+
+      const graphClient = createMockGraphClient([
+        {
+          content: [{ type: 'text', text: JSON.stringify({ ok: true }) }],
+          _meta: { http_status: 202 },
+        },
+      ]);
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(
+        server as unknown as Parameters<typeof registerGraphTools>[0],
+        graphClient as unknown as Parameters<typeof registerGraphTools>[1]
+      );
+
+      await server.tools.get('send-mail')!.handler({
+        body: JSON.stringify({
+          message: { toRecipients: [{ emailAddress: { address: 'a@ext.com' } }] },
+        }),
+      });
+
+      const payload = auditLogMock.mock.calls[0][0];
+      expect(payload).toMatchObject({ recipient_count: 1, recipient_domains: ['ext.com'] });
+    });
+
+    it('leaves a base64 upload body alone instead of warning on every upload', async () => {
+      mockEndpoints.push(
+        makeEndpoint({
+          method: 'put',
+          path: '/me/photo/$value',
+          alias: 'upload-my-profile-photo',
+          requestFormat: 'binary',
+          parameters: [{ name: 'body', type: 'Body', schema: z.string() }],
+        })
+      );
+      mockEndpointsJson = [
+        makeConfig({
+          pathPattern: '/me/photo/$value',
+          method: 'put',
+          toolName: 'upload-my-profile-photo',
+        }),
+      ];
+
+      const graphClient = createMockGraphClient([
+        { content: [{ type: 'text', text: '{}' }], _meta: { http_status: 200 } },
+      ]);
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(
+        server as unknown as Parameters<typeof registerGraphTools>[0],
+        graphClient as unknown as Parameters<typeof registerGraphTools>[1]
+      );
+
+      await server.tools.get('upload-my-profile-photo')!.handler({
+        body: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB',
+      });
+
+      const payload = auditLogMock.mock.calls[0][0];
+      expect(payload).not.toHaveProperty('recipient_count');
+      // Base64 is never JSON. Parsing it warned on every upload, and the parse error
+      // carries a slice of the file into the operational log
+      expect(loggerMock.warn).not.toHaveBeenCalledWith(
+        expect.stringContaining('Skipped recipient audit metadata')
+      );
+    });
+
+    it('records driveItem invite recipients, which use email rather than emailAddress', async () => {
+      draftEndpoint();
+      // share-drive-item mails an outsider a link to the file
+      const payload = await runDraft({
+        recipients: [{ email: 'outsider@ext.com' }],
+        roles: ['read'],
+        sendInvitation: true,
+      });
+
+      expect(payload).toMatchObject({ recipient_count: 1, recipient_domains: ['ext.com'] });
+    });
+
+    it('records meeting participants, which use upn', async () => {
+      draftEndpoint();
+      const payload = await runDraft({
+        participants: { attendees: [{ upn: 'guest@ext.com' }] },
+      });
+
+      expect(payload).toMatchObject({ recipient_count: 1, recipient_domains: ['ext.com'] });
+    });
+
+    it('survives a deeply nested array without blowing the stack', async () => {
+      draftEndpoint();
+      // Must terminate, not overflow - this walker runs inside the catch handler. 500 is
+      // far past MAX_BODY_DEPTH and still serialises on every Node we support; going
+      // deeper only tests where JSON.stringify gives out, which moves between versions.
+      let nested: unknown = [{ toRecipients: [{ emailAddress: { address: 'deep@ext.com' } }] }];
+      for (let i = 0; i < 500; i++) nested = [nested];
+
+      const payload = await runDraft({ requests: nested });
+
+      // Too deep to reach, but it has to return rather than throw
+      expect(payload).not.toHaveProperty('recipient_count');
+      expect(payload.status).toBe('success');
+    });
+
+    it('still audits a call whose params cannot be serialised for the log', async () => {
+      draftEndpoint();
+      // The params log line runs before the try that writes the audit record, so an
+      // unguarded stringify there escapes the tool entirely: protocol error, no trail.
+      const circular: Record<string, unknown> = { subject: 'loop' };
+      circular.self = circular;
+
+      const payload = await runDraft(circular);
+
+      expect(auditLogMock).toHaveBeenCalledTimes(1);
+      expect(payload).toMatchObject({ tool: 'create-draft-email', status: 'error' });
+    });
+
+    it('still records recipients when the request throws', async () => {
+      draftEndpoint();
+      const graphClient = {
+        graphRequest: vi.fn().mockRejectedValue(new Error('socket hang up')),
+      };
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(
+        server as unknown as Parameters<typeof registerGraphTools>[0],
+        graphClient as unknown as Parameters<typeof registerGraphTools>[1]
+      );
+
+      await server.tools.get('create-draft-email')!.handler({
+        body: { toRecipients: [{ emailAddress: { address: 'a@ext.com' } }] },
+      });
+
+      // A timeout is not proof of non-delivery, so the signal has to survive
+      const payload = auditLogMock.mock.calls[0][0];
+      expect(payload.status).toBe('error');
+      expect(payload).toMatchObject({ recipient_count: 1, recipient_domains: ['ext.com'] });
+    });
+
+    it('walks recipients nested inside a graph-batch sub-request', async () => {
+      draftEndpoint();
+      // Routing a send through /$batch used to record nothing at all
+      const payload = await runDraft({
+        requests: [
+          { id: '1', method: 'GET', url: '/me/messages?$top=5' },
+          {
+            id: '2',
+            method: 'POST',
+            url: '/me/sendMail',
+            body: { message: { toRecipients: [{ emailAddress: { address: 'a@ext.com' } }] } },
+          },
+        ],
+      });
+
+      expect(payload).toMatchObject({ recipient_count: 1, recipient_domains: ['ext.com'] });
+    });
+
+    it('reaches an itemAttachment nested inside a graph-batch sub-request', async () => {
+      draftEndpoint();
+      // Deepest shape the docstring promises: 7 levels, one under MAX_BODY_DEPTH. Pinned
+      // so trimming the budget fails here rather than quietly dropping the case.
+      const payload = await runDraft({
+        requests: [
+          {
+            id: '1',
+            method: 'POST',
+            url: '/me/sendMail',
+            body: {
+              message: {
+                toRecipients: [{ emailAddress: { address: 'direct@ext.com' } }],
+                attachments: [
+                  {
+                    '@odata.type': '#microsoft.graph.itemAttachment',
+                    item: {
+                      toRecipients: [{ emailAddress: { address: 'forwarded@deeper.example' } }],
+                    },
+                  },
+                ],
+              },
+            },
+          },
+        ],
+      });
+
+      expect(payload.recipient_count).toBe(2);
+      expect(payload.recipient_domains).toEqual(['deeper.example', 'ext.com']);
+    });
+
+    it('reads a bare string entry, malformed though it is', async () => {
+      draftEndpoint();
+      const payload = await runDraft({ toRecipients: ['a@ext.com'] });
+
+      // Graph rejects this shape, so nothing is delivered - but an attempted send to an
+      // outside domain is exactly what the trail is for
+      expect(payload).toMatchObject({ recipient_count: 1, recipient_domains: ['ext.com'] });
+    });
+
+    it('reads an all-PascalCase recipient entry, as Graph accepts it', async () => {
+      draftEndpoint();
+      const payload = await runDraft({
+        ToRecipients: [{ EmailAddress: { Address: 'a@ext.com' } }],
+      });
+
+      expect(payload).toMatchObject({ recipient_count: 1, recipient_domains: ['ext.com'] });
+    });
+
+    it('normalises a display-name address down to the bare domain', async () => {
+      draftEndpoint();
+      const payload = await runDraft({
+        toRecipients: [
+          { emailAddress: { address: 'Bob <bob@ext.com>' } },
+          { emailAddress: { address: 'a@ext.com ' } },
+          { emailAddress: { address: 'c@ext.com note' } },
+        ],
+      });
+
+      // Same domain three ways - unnormalised that's three entries, one carrying junk
+      expect(payload.recipient_domains).toEqual(['ext.com']);
+      expect(payload.recipient_count).toBe(3);
+    });
+
+    it('caps the domain list but keeps recipient_count exact', async () => {
+      draftEndpoint();
+      const payload = await runDraft({
+        toRecipients: Array.from({ length: 60 }, (_, i) => ({
+          emailAddress: { address: `user@d${String(i).padStart(2, '0')}.example` },
+        })),
+      });
+
+      // The count is the detection signal, so it has to survive the cap
+      expect(payload.recipient_count).toBe(60);
+      expect(payload.recipient_domains).toHaveLength(50);
+      expect(payload.recipient_domains_truncated).toBe(true);
+    });
+
+    it('does not flag truncation when the domain list fits', async () => {
+      draftEndpoint();
+      const payload = await runDraft({
+        toRecipients: [{ emailAddress: { address: 'a@example.com' } }],
+      });
+
+      expect(payload).not.toHaveProperty('recipient_domains_truncated');
+    });
+
+    it('omits both fields when a request has no recipients', async () => {
+      draftEndpoint();
+      const payload = await runDraft({ subject: 'a draft with no recipients yet' });
+
+      expect(payload).not.toHaveProperty('recipient_count');
+      expect(payload).not.toHaveProperty('recipient_domains');
+    });
   });
 
   // ---- 1. $count advanced query mode ----
@@ -162,6 +1124,571 @@ describe('graph-tools', () => {
       const [url] = graphClient.graphRequest.mock.calls[0];
       // $count=true should appear in query string
       expect(url).toContain('$count=true');
+    });
+  });
+
+  describe('audit target resources', () => {
+    it('adds target_resource to generated Graph tool audit events', async () => {
+      const endpoint = makeEndpoint({
+        alias: 'get-drive-item',
+        path: '/drives/:driveId/items/:driveItemId',
+        parameters: [
+          { name: 'driveId', type: 'Path', schema: z.string() },
+          { name: 'driveItemId', type: 'Path', schema: z.string() },
+        ],
+      });
+      const config = makeConfig({
+        toolName: 'get-drive-item',
+        pathPattern: '/drives/{drive-id}/items/{driveItem-id}',
+        scopes: ['Files.Read'],
+      });
+      mockEndpoints.push(endpoint);
+      mockEndpointsJson = [config];
+
+      const graphClient = createMockGraphClient([
+        { content: [{ type: 'text', text: JSON.stringify({ id: 'item-2' }) }] },
+      ]);
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      await server.tools.get('get-drive-item')!.handler({
+        driveId: 'drive-1',
+        driveItemId: 'item-2',
+      });
+
+      expect(auditLogMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'tool.call',
+          tool: 'get-drive-item',
+          status: 'success',
+          target_resource: {
+            type: 'drive_item',
+            id: '/drives/drive-1/items/item-2',
+          },
+        })
+      );
+    });
+
+    it('adds target_resource to failed generated Graph tool audit events', async () => {
+      const endpoint = makeEndpoint({
+        alias: 'get-drive-item',
+        path: '/drives/:driveId/items/:driveItemId',
+        parameters: [
+          { name: 'driveId', type: 'Path', schema: z.string() },
+          { name: 'driveItemId', type: 'Path', schema: z.string() },
+        ],
+      });
+      const config = makeConfig({
+        toolName: 'get-drive-item',
+        pathPattern: '/drives/{drive-id}/items/{driveItem-id}',
+        scopes: ['Files.Read'],
+      });
+      mockEndpoints.push(endpoint);
+      mockEndpointsJson = [config];
+
+      const graphClient = createMockGraphClient();
+      graphClient.graphRequest.mockRejectedValueOnce(
+        Object.assign(new Error('Forbidden'), { status: 403 })
+      );
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(
+        server as unknown as Parameters<typeof registerGraphTools>[0],
+        graphClient as unknown as Parameters<typeof registerGraphTools>[1]
+      );
+
+      const result = await server.tools.get('get-drive-item')!.handler({
+        driveId: 'drive-1',
+        driveItemId: 'item-2',
+      });
+
+      expect(result.isError).toBe(true);
+      expect(auditLogMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'tool.call',
+          tool: 'get-drive-item',
+          status: 'error',
+          error_code: 403,
+          target_resource: {
+            type: 'drive_item',
+            id: '/drives/drive-1/items/item-2',
+          },
+        })
+      );
+    });
+
+    it('derives target_resource from generic ID path parameters', async () => {
+      const endpoint = makeEndpoint({
+        alias: 'get-mail-message',
+        path: '/me/messages/:messageId',
+        parameters: [{ name: 'messageId', type: 'Path', schema: z.string() }],
+      });
+      const config = makeConfig({
+        toolName: 'get-mail-message',
+        pathPattern: '/me/messages/{message-id}',
+      });
+      mockEndpoints.push(endpoint);
+      mockEndpointsJson = [config];
+
+      const graphClient = createMockGraphClient([
+        { content: [{ type: 'text', text: JSON.stringify({ id: 'message-1' }) }] },
+      ]);
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      await server.tools.get('get-mail-message')!.handler({
+        messageId: 'message-1',
+      });
+
+      expect(auditLogMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'tool.call',
+          tool: 'get-mail-message',
+          status: 'success',
+          target_resource: {
+            type: 'message',
+            id: '/me/messages/message-1',
+          },
+        })
+      );
+    });
+
+    it('omits target_resource when an ID path parameter is missing', async () => {
+      const endpoint = makeEndpoint({
+        alias: 'get-drive-item',
+        path: '/drives/:driveId/items/:driveItemId',
+        parameters: [
+          { name: 'driveId', type: 'Path', schema: z.string() },
+          { name: 'driveItemId', type: 'Path', schema: z.string() },
+        ],
+      });
+      const config = makeConfig({
+        toolName: 'get-drive-item',
+        pathPattern: '/drives/{drive-id}/items/{driveItem-id}',
+        scopes: ['Files.Read'],
+      });
+      mockEndpoints.push(endpoint);
+      mockEndpointsJson = [config];
+
+      const graphClient = createMockGraphClient([
+        { content: [{ type: 'text', text: JSON.stringify({ id: 'item-2' }) }] },
+      ]);
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      await server.tools.get('get-drive-item')!.handler({
+        driveId: 'drive-1',
+      });
+
+      const [payload] = auditLogMock.mock.calls[0];
+      expect(payload).toMatchObject({
+        event: 'tool.call',
+        tool: 'get-drive-item',
+        status: 'success',
+      });
+      expect(payload).not.toHaveProperty('target_resource');
+    });
+
+    it('omits SharePoint path parameters from target_resource', async () => {
+      const endpoint = makeEndpoint({
+        alias: 'get-sharepoint-site-by-path',
+        path: "/sites/:siteId/getByPath(path=':path')",
+        parameters: [
+          { name: 'siteId', type: 'Path', schema: z.string() },
+          { name: 'path', type: 'Path', schema: z.string() },
+        ],
+      });
+      const config = makeConfig({
+        toolName: 'get-sharepoint-site-by-path',
+        pathPattern: '/sites/{site-id}:/{path}',
+        scopes: [['Sites.Read.All'], ['Sites.Selected']],
+      });
+      mockEndpoints.push(endpoint);
+      mockEndpointsJson = [config];
+
+      const graphClient = createMockGraphClient([
+        { content: [{ type: 'text', text: JSON.stringify({ id: 'site-1' }) }] },
+      ]);
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      await server.tools.get('get-sharepoint-site-by-path')!.handler({
+        siteId: 'contoso.sharepoint.com',
+        path: '/sites/Finance',
+      });
+
+      expect(auditLogMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'tool.call',
+          tool: 'get-sharepoint-site-by-path',
+          status: 'success',
+          target_resource: {
+            type: 'site',
+            id: '/sites/contoso.sharepoint.com',
+          },
+        })
+      );
+      const [payload] = auditLogMock.mock.calls[0];
+      expect(JSON.stringify(payload)).not.toContain('Finance');
+    });
+
+    it('omits target_resource for generated broad list/search audit events', async () => {
+      const endpoint = makeEndpoint({
+        alias: 'list-mail-messages',
+        path: '/me/messages',
+      });
+      const config = makeConfig({
+        toolName: 'list-mail-messages',
+        pathPattern: '/me/messages',
+      });
+      mockEndpoints.push(endpoint);
+      mockEndpointsJson = [config];
+
+      const graphClient = createMockGraphClient([
+        { content: [{ type: 'text', text: JSON.stringify({ value: [] }) }] },
+      ]);
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      await server.tools.get('list-mail-messages')!.handler({ search: 'budget' });
+
+      const [payload] = auditLogMock.mock.calls[0];
+      expect(payload).toMatchObject({
+        event: 'tool.call',
+        tool: 'list-mail-messages',
+        status: 'success',
+      });
+      expect(payload).not.toHaveProperty('target_resource');
+    });
+  });
+
+  // ---- 2a. skiptoken cursor paging ----
+  describe('shared query contract at execution', () => {
+    it.each([{ skiptoken: 123 }, { $SKIPTOKEN: 123 }, { COUNT: 'true' }, { $Count: 'true' }])(
+      'rejects invalid cursor and mixed-case query values: %j',
+      async (params) => {
+        mockEndpoints.push(makeEndpoint());
+        mockEndpointsJson = [makeConfig()];
+        const graphClient = createMockGraphClient();
+        const server = createMockServer();
+        const { registerGraphTools } = await loadModule();
+        registerGraphTools(server as any, graphClient as any);
+        const result = await server.tools.get('test-tool')!.handler(params);
+        expect(result.isError).toBe(true);
+        expect(graphClient.graphRequest).not.toHaveBeenCalled();
+      }
+    );
+
+    it('accepts valid mixed-case query values and string cursors', async () => {
+      mockEndpoints.push(makeEndpoint());
+      mockEndpointsJson = [makeConfig()];
+      const graphClient = createMockGraphClient();
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+      await server.tools.get('test-tool')!.handler({ COUNT: true, $SKIPTOKEN: 'next-token' });
+      expect(graphClient.graphRequest).toHaveBeenCalledTimes(1);
+      const request = JSON.stringify(graphClient.graphRequest.mock.calls[0]);
+      expect(request).toContain('$count=true');
+      expect(request).toContain('$skiptoken=next-token');
+    });
+
+    it.each(['list-calendar-events-delta', 'list-calendar-view-delta'])(
+      'ignores stale mixed-case top values for %s',
+      async (alias) => {
+        mockEndpoints.push(makeEndpoint({ alias }));
+        mockEndpointsJson = [makeConfig({ toolName: alias })];
+        const graphClient = createMockGraphClient();
+        const server = createMockServer();
+        const { registerGraphTools } = await loadModule();
+        registerGraphTools(server as any, graphClient as any);
+        for (const key of ['top', '$top', 'TOP', '$TOP', '$Top']) {
+          await server.tools.get(alias)!.handler({ [key]: 10 });
+        }
+        expect(graphClient.graphRequest).toHaveBeenCalledTimes(5);
+        for (const call of graphClient.graphRequest.mock.calls) {
+          expect(JSON.stringify(call)).not.toContain('$top');
+        }
+      }
+    );
+
+    it.each(['list-joined-teams', 'list-my-associated-teams'])(
+      'rejects unsupported query options before Graph dispatch for %s',
+      async (alias) => {
+        mockEndpoints.push(makeEndpoint({ alias }));
+        mockEndpointsJson = [makeConfig({ toolName: alias })];
+        const graphClient = createMockGraphClient();
+        const server = createMockServer();
+        const { registerGraphTools } = await loadModule();
+        registerGraphTools(server as any, graphClient as any);
+        for (const key of ['top', '$top', 'skiptoken', '$skiptoken', 'select', '$select']) {
+          const value = key.replace('$', '') === 'top' ? 100 : 'next-token';
+          const result = await server.tools.get(alias)!.handler({ [key]: value });
+          expect(result.isError).toBe(true);
+        }
+        expect(graphClient.graphRequest).not.toHaveBeenCalled();
+      }
+    );
+
+    it('rejects oversized chat pages before Graph dispatch, including dollar-prefixed input', async () => {
+      mockEndpoints.push(makeEndpoint({ alias: 'list-chats' }));
+      mockEndpointsJson = [makeConfig({ toolName: 'list-chats' })];
+      const graphClient = createMockGraphClient();
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+      for (const key of ['top', '$top']) {
+        const result = await server.tools.get('list-chats')!.handler({ [key]: 100 });
+        expect(result.isError).toBe(true);
+      }
+      expect(graphClient.graphRequest).not.toHaveBeenCalled();
+    });
+
+    it('sends a calendar field array as comma-separated text in one Graph request', async () => {
+      const alias = 'list-calendar-events-delta';
+      mockEndpoints.push(makeEndpoint({ alias }));
+      mockEndpointsJson = [makeConfig({ toolName: alias })];
+      const graphClient = createMockGraphClient();
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+      await server.tools.get(alias)!.handler({ select: ['id', 'subject'] });
+      expect(graphClient.graphRequest).toHaveBeenCalledTimes(1);
+      expect(JSON.stringify(graphClient.graphRequest.mock.calls[0])).toContain('id,subject');
+    });
+  });
+
+  describe('skiptoken cursor', () => {
+    const prevAllowPagination = process.env.MS365_MCP_ALLOW_PAGINATION;
+    afterEach(() => {
+      if (prevAllowPagination === undefined) delete process.env.MS365_MCP_ALLOW_PAGINATION;
+      else process.env.MS365_MCP_ALLOW_PAGINATION = prevAllowPagination;
+    });
+
+    const callForResult = async (args: Record<string, unknown>) => {
+      mockEndpoints.push(makeEndpoint());
+      mockEndpointsJson = [makeConfig()];
+      const graphClient = createMockGraphClient();
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+      const result = await server.tools.get('test-tool')!.handler(args);
+      return { result, graphClient };
+    };
+
+    /** The request path the tool sent to Graph. */
+    const callWith = async (args: Record<string, unknown>) => {
+      const { graphClient } = await callForResult(args);
+      return graphClient.graphRequest.mock.calls[0][0] as string;
+    };
+
+    /** A single-object GET: $select/$expand and nothing collection-shaped. */
+    const singleObjectEndpoint = () =>
+      makeEndpoint({
+        alias: 'get-thing',
+        path: '/me/thing',
+        parameters: [
+          { name: 'select', type: 'Query', schema: z.string().optional() },
+          { name: 'expand', type: 'Query', schema: z.string().optional() },
+        ],
+      });
+
+    const registerAnd = async (endpoint: any, config: any) => {
+      mockEndpoints.push(endpoint);
+      mockEndpointsJson = [config];
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, createMockGraphClient() as any);
+      return server;
+    };
+
+    it('omits skiptoken on single-object GETs', async () => {
+      const server = await registerAnd(
+        singleObjectEndpoint(),
+        makeConfig({ toolName: 'get-thing', pathPattern: '/me/thing' })
+      );
+
+      expect(server.tools.get('get-thing')!.schema.skiptoken).toBeUndefined();
+    });
+
+    it('keeps skiptoken on delta tools that have $top stripped', async () => {
+      // list-calendar-events-delta pages via cursor but is in TOP_UNSUPPORTED_DELTA_TOOLS,
+      // so a $top-only test would strip the cursor from an endpoint that needs it.
+      const endpoint = makeEndpoint({
+        alias: 'list-calendar-events-delta',
+        path: '/me/calendarView/delta',
+      });
+      const server = await registerAnd(
+        endpoint,
+        makeConfig({
+          toolName: 'list-calendar-events-delta',
+          pathPattern: '/me/calendarView/delta',
+        })
+      );
+
+      const schema = server.tools.get('list-calendar-events-delta')!.schema;
+      expect(schema.top).toBeUndefined();
+      expect(schema.skiptoken).toBeDefined();
+    });
+
+    it('advertises skiptoken on GET list tools', async () => {
+      mockEndpoints.push(makeEndpoint());
+      mockEndpointsJson = [makeConfig()];
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, createMockGraphClient() as any);
+
+      expect(server.tools.get('test-tool')!.schema.skiptoken).toBeDefined();
+    });
+
+    it('still advertises skiptoken when MS365_MCP_ALLOW_PAGINATION is disabled', async () => {
+      // Manual paging returns one page, so the auto-follow kill switch must not
+      // remove the only cursor a stateless client has.
+      process.env.MS365_MCP_ALLOW_PAGINATION = '0';
+      mockEndpoints.push(makeEndpoint());
+      mockEndpointsJson = [makeConfig()];
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, createMockGraphClient() as any);
+
+      expect(server.tools.get('test-tool')!.schema.fetchAllPages).toBeUndefined();
+      expect(server.tools.get('test-tool')!.schema.skiptoken).toBeDefined();
+    });
+
+    it('forwards a bare token as $skiptoken', async () => {
+      const path = await callWith({ skiptoken: 'abc123' });
+      expect(path).toContain('$skiptoken=abc123');
+    });
+
+    it('does not double-encode a token copied from @odata.nextLink', async () => {
+      // Tokens arrive percent-encoded straight out of the nextLink URL; encoding
+      // them again yields %253d and Graph rejects the cursor.
+      const path = await callWith({ skiptoken: 'eyJhIjoxfQ%3d%3d' });
+      expect(path).toContain('$skiptoken=eyJhIjoxfQ%3D%3D');
+      expect(path).not.toContain('%253');
+    });
+
+    it('extracts the token when handed a whole nextLink URL', async () => {
+      const path = await callWith({
+        skiptoken: 'https://graph.microsoft.com/v1.0/me/chats?$top=5&$filter=x&$skiptoken=tok123',
+      });
+      expect(path).toContain('$skiptoken=tok123');
+      expect(path).not.toContain('graph.microsoft.com');
+    });
+
+    it('keeps only the cursor when the nextLink has params after it', async () => {
+      const path = await callWith({ skiptoken: '$skiptoken=tok123&$top=5' });
+      expect(path).toContain('$skiptoken=tok123');
+      expect(path).not.toContain('tok123&');
+    });
+
+    it('accepts the $-prefixed param name', async () => {
+      const path = await callWith({ $skiptoken: 'abc123' });
+      expect(path).toContain('$skiptoken=abc123');
+    });
+
+    it.each(['', '   '])('omits $skiptoken entirely when blank (%j)', async (blank) => {
+      const path = await callWith({ skiptoken: blank });
+      expect(path).not.toContain('skiptoken');
+    });
+
+    it('sends $skip when the nextLink pages with $skip', async () => {
+      // Outlook mail and calendar nextLinks carry $skip, not $skiptoken
+      const path = await callWith({
+        top: 10,
+        skiptoken: 'https://graph.microsoft.com/v1.0/me/messages?$top=10&$skip=10',
+      });
+      expect(path).toContain('$skip=10');
+      expect(path).not.toContain('skiptoken');
+    });
+
+    it('ignores a cursor-looking value inside another query param', async () => {
+      const path = await callWith({
+        skiptoken:
+          "https://graph.microsoft.com/v1.0/me/messages?$filter=subject eq '%24skip=100'&$skip=10",
+      });
+      expect(path).toContain('$skip=10');
+      expect(path).not.toContain('100');
+    });
+
+    it('refuses a link with no cursor to page with', async () => {
+      const { result, graphClient } = await callForResult({
+        skiptoken:
+          'https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages/delta()?$deltatoken=abc',
+      });
+
+      expect(result.isError).toBe(true);
+      expect(JSON.parse(result.content[0].text).error).toBe('invalid_skiptoken');
+      expect(graphClient.graphRequest).not.toHaveBeenCalled();
+    });
+
+    it('refuses a delta token= link without calling it a deltaLink', async () => {
+      // get-drive-delta and get-sharepoint-sites-delta page with token=, so the refusal must
+      // not tell the model to pass the @odata.nextLink it just passed
+      const { result, graphClient } = await callForResult({
+        skiptoken: 'https://graph.microsoft.com/v1.0/me/drive/delta(token=1230919asd190410jlka)',
+      });
+
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.error).toBe('invalid_skiptoken');
+      expect(payload.message).not.toContain('deltaLink');
+      expect(payload.message).toContain('fetchAllPages');
+      expect(graphClient.graphRequest).not.toHaveBeenCalled();
+    });
+
+    it('refuses a link whose $skiptoken carries no value', async () => {
+      const { result } = await callForResult({
+        skiptoken: 'https://graph.microsoft.com/v1.0/me/chats?$skiptoken=&$top=5',
+      });
+
+      expect(result.isError).toBe(true);
+      expect(JSON.parse(result.content[0].text).error).toBe('invalid_skiptoken');
+    });
+
+    it('accepts an encoded %24skiptoken marker', async () => {
+      const path = await callWith({
+        skiptoken: 'https://graph.microsoft.com/v1.0/me/chats?%24top=5&%24skiptoken=tok123',
+      });
+      expect(path).toContain('$skiptoken=tok123');
+    });
+
+    it.each([
+      ['https://graph.microsoft.com/v1.0/me/messages?$top=10&$skip=0', '$skip=0'],
+      ['https://graph.microsoft.com/v1.0/me/messages?%24top=10&%24skip=10', '$skip=10'],
+    ])('reads the $skip cursor out of %s', async (link, expected) => {
+      const path = await callWith({ skiptoken: link });
+      expect(path).toContain(expected);
+    });
+
+    it('refuses a $skip cursor that is not a plain number', async () => {
+      const { result } = await callForResult({
+        skiptoken: 'https://graph.microsoft.com/v1.0/me/messages?$skip=10junk',
+      });
+
+      expect(JSON.parse(result.content[0].text).error).toBe('invalid_skiptoken');
+    });
+
+    it('offers no fetchAllPages in the refusal when pagination is disabled', async () => {
+      process.env.MS365_MCP_ALLOW_PAGINATION = '0';
+      const { result } = await callForResult({
+        skiptoken: 'https://graph.microsoft.com/v1.0/me/drive/delta(token=1230919asd190410jlka)',
+      });
+
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.error).toBe('invalid_skiptoken');
+      expect(payload.message).not.toContain('fetchAllPages');
+    });
+
+    it('sends the cursor alongside the original query options', async () => {
+      const path = await callWith({ filter: "chatType eq 'oneOnOne'", top: 5, skiptoken: 'tok' });
+      expect(path).toContain('$filter=');
+      expect(path).toContain('$top=5');
+      expect(path).toContain('$skiptoken=tok');
     });
   });
 
@@ -215,6 +1742,133 @@ describe('graph-tools', () => {
       expect(parsed['@odata.nextLink']).toBeUndefined();
     });
 
+    it('returns and audits a later-page Graph error instead of partial success', async () => {
+      const endpoint = makeEndpoint();
+      const config = makeConfig();
+      mockEndpoints.push(endpoint);
+      mockEndpointsJson = [config];
+
+      const graphClient = createMockGraphClient([
+        {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                value: [{ id: '1' }],
+                '@odata.nextLink': 'https://graph.microsoft.com/v1.0/me/messages?$skip=1',
+              }),
+            },
+          ],
+          _meta: { http_status: 200 },
+        },
+        {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({ error: 'Microsoft Graph API error: 429 Too Many Requests' }),
+            },
+          ],
+          isError: true,
+          _meta: { http_status: 429, error_code: 'tooManyRequests' },
+        },
+      ]);
+
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      const result = await server.tools.get('test-tool')!.handler({ fetchAllPages: true });
+
+      expect(result.isError).toBe(true);
+      expect(JSON.parse(result.content[0].text).error).toContain('429 Too Many Requests');
+      expect(graphClient.graphRequest).toHaveBeenCalledTimes(2);
+      expect(loggerMock.error).not.toHaveBeenCalledWith(
+        expect.stringContaining('Error during pagination')
+      );
+      expect(auditLogMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'tool.call',
+          tool: 'test-tool',
+          status: 'error',
+          http_status: 429,
+          error_code: 'tooManyRequests',
+        })
+      );
+    });
+
+    it('merges all pages under --toon and encodes the combined result once (#560)', async () => {
+      const endpoint = makeEndpoint();
+      const config = makeConfig();
+      mockEndpoints.push(endpoint);
+      mockEndpointsJson = [config];
+
+      // Pages are JSON here to mimic the forceJsonOutput path; the mock's serialize
+      // adds the TOON prefix so we can check the merged result was re-encoded (#560).
+      const graphClient = createMockGraphClient(
+        [
+          {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({
+                  value: [{ id: '1' }, { id: '2' }],
+                  '@odata.nextLink': 'https://graph.microsoft.com/v1.0/me/messages?$skip=2',
+                }),
+              },
+            ],
+          },
+          {
+            content: [{ type: 'text', text: JSON.stringify({ value: [{ id: '3' }] }) }],
+          },
+        ],
+        'toon'
+      );
+
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      const tool = server.tools.get('test-tool');
+      const result = await tool!.handler({ fetchAllPages: true });
+
+      // Both page requests must be forced to JSON so the merge can parse them.
+      for (const call of graphClient.graphRequest.mock.calls) {
+        expect(call[1]?.forceJsonOutput).toBe(true);
+      }
+
+      // Final body is encoded once via serialize() in the configured (toon) format,
+      // not re-parsed as JSON. It must still contain all 3 merged items.
+      expect(graphClient.serialize).toHaveBeenCalledTimes(1);
+      expect(result.content[0].text.startsWith('TOON:')).toBe(true);
+      const parsed = JSON.parse(result.content[0].text.slice('TOON:'.length));
+      expect(parsed.value.map((v: any) => v.id)).toEqual(['1', '2', '3']);
+      expect(parsed['@odata.nextLink']).toBeUndefined();
+    });
+
+    it('does not inject value:[] when fetchAllPages hits a single-object (non-collection) GET', async () => {
+      const endpoint = makeEndpoint();
+      const config = makeConfig();
+      mockEndpoints.push(endpoint);
+      mockEndpointsJson = [config];
+
+      // Single-object response (no `value`). fetchAllPages can be set on any GET,
+      // and the merge must leave the object alone, not graft on an empty value array.
+      const graphClient = createMockGraphClient([
+        { content: [{ type: 'text', text: JSON.stringify({ id: 'abc', displayName: 'Solo' }) }] },
+      ]);
+
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      const result = await server.tools.get('test-tool')!.handler({ fetchAllPages: true });
+      const parsed = JSON.parse(result.content[0].text);
+
+      expect(parsed).toEqual({ id: 'abc', displayName: 'Solo' });
+      expect(parsed.value).toBeUndefined();
+      expect(graphClient.graphRequest).toHaveBeenCalledTimes(1);
+    });
+
     it('should stop at 100 page limit', async () => {
       const endpoint = makeEndpoint();
       const config = makeConfig();
@@ -247,6 +1901,124 @@ describe('graph-tools', () => {
 
       // 1 initial + 99 pagination = 100 total requests (stops at pageCount=100)
       expect(graphClient.graphRequest).toHaveBeenCalledTimes(100);
+    });
+
+    describe('pagination env caps', () => {
+      const prev = {
+        pages: process.env.MS365_MCP_MAX_PAGES,
+        items: process.env.MS365_MCP_MAX_ITEMS,
+        allow: process.env.MS365_MCP_ALLOW_PAGINATION,
+      };
+
+      afterEach(() => {
+        const restore = (name: string, value: string | undefined) =>
+          value === undefined ? delete process.env[name] : (process.env[name] = value);
+        restore('MS365_MCP_MAX_PAGES', prev.pages);
+        restore('MS365_MCP_MAX_ITEMS', prev.items);
+        restore('MS365_MCP_ALLOW_PAGINATION', prev.allow);
+      });
+
+      const paginatingResponses = (count: number) =>
+        Array.from({ length: count }, (_, i) => ({
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                value: [{ id: `item-${i}` }],
+                '@odata.nextLink': 'https://graph.microsoft.com/v1.0/me/messages?$skip=' + (i + 1),
+              }),
+            },
+          ],
+        }));
+
+      it('should honor MS365_MCP_MAX_PAGES below the default', async () => {
+        process.env.MS365_MCP_MAX_PAGES = '2';
+        mockEndpoints.push(makeEndpoint());
+        mockEndpointsJson = [makeConfig()];
+
+        const graphClient = createMockGraphClient(paginatingResponses(5));
+        const server = createMockServer();
+        const { registerGraphTools } = await loadModule();
+        registerGraphTools(server as any, graphClient as any);
+
+        await server.tools.get('test-tool')!.handler({ fetchAllPages: true });
+
+        // 1 initial + 1 pagination = 2 total requests (stops at pageCount=2)
+        expect(graphClient.graphRequest).toHaveBeenCalledTimes(2);
+      });
+
+      it('should honor MS365_MCP_MAX_ITEMS below the default', async () => {
+        process.env.MS365_MCP_MAX_ITEMS = '2';
+        mockEndpoints.push(makeEndpoint());
+        mockEndpointsJson = [makeConfig()];
+
+        // First page already carries 2 items → the while-loop guard stops it.
+        const graphClient = createMockGraphClient([
+          {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({
+                  value: [{ id: '1' }, { id: '2' }],
+                  '@odata.nextLink': 'https://graph.microsoft.com/v1.0/me/messages?$skip=2',
+                }),
+              },
+            ],
+          },
+          ...paginatingResponses(3),
+        ]);
+        const server = createMockServer();
+        const { registerGraphTools } = await loadModule();
+        registerGraphTools(server as any, graphClient as any);
+
+        const result = await server.tools.get('test-tool')!.handler({ fetchAllPages: true });
+
+        expect(graphClient.graphRequest).toHaveBeenCalledTimes(1);
+        expect(JSON.parse(result.content[0].text).value).toHaveLength(2);
+      });
+
+      it('should not follow nextLink when MS365_MCP_ALLOW_PAGINATION is disabled', async () => {
+        process.env.MS365_MCP_ALLOW_PAGINATION = '0';
+        mockEndpoints.push(makeEndpoint());
+        mockEndpointsJson = [makeConfig()];
+
+        const graphClient = createMockGraphClient(paginatingResponses(5));
+        const server = createMockServer();
+        const { registerGraphTools } = await loadModule();
+        registerGraphTools(server as any, graphClient as any);
+
+        await server.tools.get('test-tool')!.handler({ fetchAllPages: true });
+
+        // Disabled → first page only, no nextLink following
+        expect(graphClient.graphRequest).toHaveBeenCalledTimes(1);
+        // Disabled → the parameter is not advertised to the model at all
+        expect(server.tools.get('test-tool')!.schema.fetchAllPages).toBeUndefined();
+      });
+
+      it('should advertise fetchAllPages when pagination is enabled', async () => {
+        delete process.env.MS365_MCP_ALLOW_PAGINATION;
+        mockEndpoints.push(makeEndpoint());
+        mockEndpointsJson = [makeConfig()];
+
+        const server = createMockServer();
+        const { registerGraphTools } = await loadModule();
+        registerGraphTools(server as any, createMockGraphClient() as any);
+
+        expect(server.tools.get('test-tool')!.schema.fetchAllPages).toBeDefined();
+      });
+
+      it('should reflect MS365_MCP_MAX_PAGES in the fetchAllPages description', async () => {
+        process.env.MS365_MCP_MAX_PAGES = '7';
+        mockEndpoints.push(makeEndpoint());
+        mockEndpointsJson = [makeConfig()];
+
+        const server = createMockServer();
+        const { registerGraphTools } = await loadModule();
+        registerGraphTools(server as any, createMockGraphClient() as any);
+
+        const schema = server.tools.get('test-tool')!.schema.fetchAllPages;
+        expect(schema.description).toContain('up to 7 pages');
+      });
     });
   });
 
@@ -290,6 +2062,307 @@ describe('graph-tools', () => {
 
       expect(schema['top'].description).toContain('Start small');
       expect(schema['top'].description).toContain('$select');
+    });
+    it('should describe $expand as navigation-properties-only', async () => {
+      const endpoint = makeEndpoint();
+      const config = makeConfig();
+      mockEndpoints.push(endpoint);
+      mockEndpointsJson = [config];
+
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, createMockGraphClient() as any);
+
+      const schema = server.tools.get('test-tool')!.schema;
+
+      expect(schema['expand']).toBeDefined();
+      // Must not be Microsoft's uninformative "Expand related entities".
+      expect(schema['expand'].description).not.toBe('Expand related entities');
+      expect(schema['expand'].description).toContain('navigation');
+      // Names at least one real navigation property so the model has something to copy.
+      expect(schema['expand'].description).toContain('attachments');
+    });
+
+    // graph-tools synthesizes path params only for endpoints where the generated
+    // client (via hack.ts) has not already supplied one — mostly function-style paths.
+    it('should describe path params it synthesizes itself', async () => {
+      const endpoint = makeEndpoint({ path: '/me/messages/:messageId' });
+      const config = makeConfig();
+      mockEndpoints.push(endpoint);
+      mockEndpointsJson = [config];
+
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, createMockGraphClient() as any);
+
+      const schema = server.tools.get('test-tool')!.schema;
+
+      expect(schema['messageId']).toBeDefined();
+      expect(schema['messageId'].description).not.toBe('Path parameter: messageId');
+      expect(schema['messageId'].description).toContain("not as 'id'");
+    });
+  });
+
+  // ---- $search KQL quote normalization ----
+  describe('$search quote normalization', () => {
+    async function callSearch(
+      search: string,
+      path = '/me/messages'
+    ): Promise<{ result: any; graphClient: any }> {
+      const endpoint = makeEndpoint({ path });
+      const config = makeConfig();
+      mockEndpoints.push(endpoint);
+      mockEndpointsJson = [config];
+
+      const graphClient = createMockGraphClient([
+        { content: [{ type: 'text', text: JSON.stringify({ value: [] }) }] },
+      ]);
+
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      const result = await server.tools.get('test-tool')!.handler({ search });
+      return { result, graphClient };
+    }
+
+    async function callWithSearch(search: string, path = '/me/messages'): Promise<string> {
+      const { graphClient } = await callSearch(search, path);
+      return graphClient.graphRequest.mock.calls[0][0] as string;
+    }
+
+    it('wraps a bare KQL expression in one pair of double quotes', async () => {
+      const url = await callWithSearch('from:john AND subject:meeting');
+      expect(url).toContain(`$search=${encodeURIComponent('"from:john AND subject:meeting"')}`);
+    });
+
+    it('collapses per-term quoting into a single enclosing pair', async () => {
+      const url = await callWithSearch('"from:john" AND subject:meeting');
+      expect(url).toContain(`$search=${encodeURIComponent('"from:john AND subject:meeting"')}`);
+    });
+
+    it('leaves an already correctly quoted expression untouched', async () => {
+      const url = await callWithSearch('"from:john AND subject:meeting"');
+      expect(url).toContain(`$search=${encodeURIComponent('"from:john AND subject:meeting"')}`);
+    });
+
+    // Graph rejects a property phrase that has no enclosing pair, so add one and escape the
+    // phrase quotes. Microsoft documents that escaping for directory search only; mail's own
+    // docs never show an embedded quote, so this form is inferred.
+    it('adds the enclosing pair around a property phrase', async () => {
+      const url = await callWithSearch('subject:"quarterly report"');
+      expect(url).toContain(`$search=${encodeURIComponent('"subject:\\"quarterly report\\""')}`);
+    });
+
+    it('keeps a standalone phrase grouped', async () => {
+      const url = await callWithSearch('"quarterly report" AND from:john');
+      expect(url).toContain(
+        `$search=${encodeURIComponent('"\\"quarterly report\\" AND from:john"')}`
+      );
+    });
+
+    it('leaves an already escaped phrase untouched', async () => {
+      const query = '"subject:\\"quarterly report\\""';
+      const url = await callWithSearch(query);
+      expect(url).toContain(`$search=${encodeURIComponent(query)}`);
+    });
+
+    // Already correctly wrapped free text is a multi-term search, not a phrase — escaping
+    // its quotes would narrow it to messages containing the exact phrase.
+    it('leaves already-wrapped free text as a multi-term search', async () => {
+      const query = '"quarterly report"';
+      const url = await callWithSearch(query);
+      expect(url).toContain(`$search=${encodeURIComponent(query)}`);
+    });
+
+    // Date and size restrictions use comparison operators rather than a colon; they are
+    // clauses too, so per-clause quoting must be undone rather than escaped as a phrase.
+    it.each([
+      ['"received>=2024-01-01" AND from:john', '"received>=2024-01-01 AND from:john"'],
+      ['"size>1000" AND subject:meeting', '"size>1000 AND subject:meeting"'],
+      ['"received<2024-01-01"', '"received<2024-01-01"'],
+    ])('undoes per-clause quoting on a comparison clause (%s)', async (query, expected) => {
+      const url = await callWithSearch(query);
+      expect(url).toContain(`$search=${encodeURIComponent(expected)}`);
+    });
+
+    // A phrase can open with a word and a colon without being a clause. RE and Q3 are not
+    // mail properties, so the grouping quotes have to survive.
+    it.each([
+      ['"RE: quarterly report" AND from:john', '"\\"RE: quarterly report\\" AND from:john"'],
+      ['"Q3: plan.pdf" AND subject:budget', '"\\"Q3: plan.pdf\\" AND subject:budget"'],
+    ])('keeps phrase quotes on a clause-shaped phrase (%s)', async (query, expected) => {
+      const url = await callWithSearch(query);
+      expect(url).toContain(`$search=${encodeURIComponent(expected)}`);
+    });
+
+    // The colon inside the phrase is part of the text, not a property separator.
+    it.each([
+      ['subject:"RE: quarterly report"', '"subject:\\"RE: quarterly report\\""'],
+      ['attachment:"Q3: plan.pdf"', '"attachment:\\"Q3: plan.pdf\\""'],
+    ])('keeps phrase quotes when the phrase contains a colon (%s)', async (query, expected) => {
+      const url = await callWithSearch(query);
+      expect(url).toContain(`$search=${encodeURIComponent(expected)}`);
+    });
+
+    // KQL demotes a restriction with whitespace around the operator to free text, so these
+    // are phrases. Unwrapping them would search a bare `from:`/`subject:` and quietly drop
+    // the words the caller was actually looking for.
+    it.each([
+      [
+        '"from: the desk of the CEO" AND subject:report',
+        '"\\"from: the desk of the CEO\\" AND subject:report"',
+      ],
+      [
+        '"subject: quarterly report" AND from:john',
+        '"\\"subject: quarterly report\\" AND from:john"',
+      ],
+    ])('keeps phrase quotes when a space follows the property (%s)', async (query, expected) => {
+      const url = await callWithSearch(query);
+      expect(url).toContain(`$search=${encodeURIComponent(expected)}`);
+    });
+
+    // A trailing lone backslash would escape the enclosing pair's closing quote and hand
+    // Graph an unterminated string.
+    it('balances a trailing backslash so it cannot escape the closing quote', async () => {
+      const url = await callWithSearch('from:john\\');
+      expect(url).toContain(`$search=${encodeURIComponent('"from:john\\\\"')}`);
+    });
+
+    // An unterminated run is a missing closing quote, not a stray opening one. Dropping the
+    // delimiter would shed the grouping: `subject:"quarterly report` would go out as subject
+    // matching `quarterly` with `report` loose, which is a wider search than was asked for.
+    it.each([
+      ['from:"john', '"from:\\"john\\""'],
+      ['subject:"quarterly report', '"subject:\\"quarterly report\\""'],
+    ])('closes an unterminated quote rather than dropping it (%s)', async (query, expected) => {
+      const url = await callWithSearch(query);
+      expect(url).toContain(`$search=${encodeURIComponent(expected)}`);
+    });
+
+    // A restriction binds only the token after its operator, so unwrapping a multi-word value
+    // would bind the first word and leave the rest as free text. Escaping the run in place is
+    // no better: `subject:` would end up inside the phrase as literal text and the restriction
+    // would be lost. Only moving the quotes past the operator keeps both.
+    it.each([
+      [
+        '"subject:quarterly report" AND from:john',
+        '"subject:\\"quarterly report\\" AND from:john"',
+      ],
+      ['"from:john" AND "subject:the big report"', '"from:john AND subject:\\"the big report\\""'],
+    ])('moves quotes past the operator on a multi-word value (%s)', async (query, expected) => {
+      const url = await callWithSearch(query);
+      expect(url).toContain(`$search=${encodeURIComponent(expected)}`);
+    });
+
+    // Per-clause quoting of a whole boolean group is the same directory-style mistake as
+    // quoting one clause, so it unwraps too. Escaping it would turn live restrictions into
+    // literal text and leave only the clauses outside the quotes doing any work.
+    it.each([
+      [
+        '"from:john AND subject:meeting" OR from:jane',
+        '"from:john AND subject:meeting OR from:jane"',
+      ],
+      [
+        '"from:john OR from:jane" AND hasAttachments:true',
+        '"from:john OR from:jane AND hasAttachments:true"',
+      ],
+    ])('unwraps a quoted group of clauses (%s)', async (query, expected) => {
+      const url = await callWithSearch(query);
+      expect(url).toContain(`$search=${encodeURIComponent(expected)}`);
+    });
+
+    // A missing closing quote on the enclosing pair is a dropped character, not the start of
+    // a phrase. Reading it as a phrase would search for the expression literally and match
+    // nothing, leaving the model no error to correct against.
+    it('recovers a dropped closing quote on the enclosing pair', async () => {
+      const url = await callWithSearch('"from:john AND subject:meeting');
+      expect(url).toContain(`$search=${encodeURIComponent('"from:john AND subject:meeting"')}`);
+    });
+
+    // An escaped backslash must be consumed as a unit, or its second slash pairs with the
+    // real delimiter behind it and the scan runs off the end of a well-formed string.
+    it('reads an escaped backslash before a closing quote', async () => {
+      const url = await callWithSearch('from:"a\\\\"');
+      expect(url).toContain(`$search=${encodeURIComponent('"from:\\"a\\\\\\""')}`);
+    });
+
+    // Every repair has to be a fixed point, otherwise a retry or a second pass corrupts a
+    // value this code just declared correct.
+    const CORPUS = [
+      'from:john AND subject:meeting',
+      '"from:john" AND subject:meeting',
+      'subject:"quarterly report',
+      '"subject:quarterly report" AND from:john',
+      '"from:john AND subject:meeting" OR from:jane',
+      '"from:john AND subject:meeting',
+      'from:john\\',
+      'from:"a\\\\"',
+      'subject:"abc\\',
+      '"quarterly report"',
+    ];
+
+    // The value Graph receives must be one well-formed escaped string: an opening quote, no
+    // unescaped quote before the final one, and no trailing backslash that would escape it.
+    // Asserting the shape catches a class of scanner bugs that enumerating cases misses.
+    it.each(CORPUS)('emits a balanced escaped string (%s)', async (query) => {
+      const url = await callWithSearch(query);
+      const value = new URL(url, 'https://graph.microsoft.com').searchParams.get('$search')!;
+      expect(value.startsWith('"') && value.endsWith('"')).toBe(true);
+      let unescaped = 0;
+      for (let i = 0; i < value.length; i++) {
+        if (value[i] === '\\') {
+          i++;
+          continue;
+        }
+        if (value[i] === '"') unescaped++;
+      }
+      expect(unescaped).toBe(2);
+    });
+
+    it.each(CORPUS)('normalizing twice is a no-op (%s)', async (query) => {
+      const once = await callWithSearch(query);
+      const search = new URL(once, 'https://graph.microsoft.com').searchParams.get('$search')!;
+      const twice = await callWithSearch(search);
+      expect(twice).toContain(`$search=${encodeURIComponent(search)}`);
+    });
+
+    // Dropping $search would turn a search into an unfiltered listing of the whole mailbox
+    // and return it as though it were the result, which is worse than the 400 Graph sends.
+    it.each([' ', '   ', '"', '""""'])(
+      'refuses an unsearchable $search value %j',
+      async (query) => {
+        const { result, graphClient } = await callSearch(query);
+        expect(result.isError).toBe(true);
+        expect(JSON.parse(result.content[0].text).error).toBe('invalid_search');
+        expect(graphClient.graphRequest).not.toHaveBeenCalled();
+      }
+    );
+
+    // Directory search advertises clause-level quoting, which mail's convention would
+    // destroy: collapsing the quotes below changes an OR of two clauses into one.
+    it.each([
+      ['/users', '"displayName:john" OR "displayName:jane"'],
+      // Mail-adjacent, but none of these take message KQL.
+      ['/me/mailFolders', 'foo OR bar'],
+      ['/me/mailFolders/:mailFolderId/childFolders', 'foo OR bar'],
+      ['/me/mailFolders/:mailFolderId/messageRules', 'foo OR bar'],
+      ['/me/messages/:messageId/attachments', 'foo OR bar'],
+      ['/planner/tasks/:plannerTaskId/messages', 'foo OR bar'],
+      ['/chats/:chatId/messages', 'foo OR bar'],
+      ['/teams/:teamId/channels/:channelId/messages', 'foo OR bar'],
+    ])('does not touch $search on %s', async (path, query) => {
+      const url = await callWithSearch(query, path);
+      expect(url).toContain(`$search=${encodeURIComponent(query)}`);
+    });
+
+    it.each([
+      '/me/mailFolders/:mailFolderId/messages',
+      '/users/:userId/messages',
+      '/me/mailFolders/:mailFolderId/childFolders/:childFolderId/messages',
+    ])('still normalizes on %s', async (path) => {
+      const url = await callWithSearch('"from:john" AND subject:meeting', path);
+      expect(url).toContain(`$search=${encodeURIComponent('"from:john AND subject:meeting"')}`);
     });
   });
 
@@ -575,6 +2648,7 @@ describe('graph-tools', () => {
       await server.tools.get('create-reply-draft')!.handler({
         messageId: 'AAMk123',
         body: { Message: { body: { contentType: 'html', content: '<p>hi</p>' } } },
+        confirm: true, // destructive POST — required by isDestructiveOperation gate
       });
 
       const [, options] = graphClient.graphRequest.mock.calls[0];
@@ -623,6 +2697,7 @@ describe('graph-tools', () => {
         driveId: 'drive123',
         driveItemId: 'item456',
         body: base64,
+        confirm: true, // destructive PUT — required by isDestructiveOperation gate
       });
 
       const [path, options] = graphClient.graphRequest.mock.calls[0];
@@ -664,6 +2739,7 @@ describe('graph-tools', () => {
         driveId: 'd',
         driveItemId: 'i',
         body: Buffer.from('%PDF-1.4').toString('base64'),
+        confirm: true, // destructive PUT — required by isDestructiveOperation gate
       });
 
       const [, options] = graphClient.graphRequest.mock.calls[0];
@@ -705,6 +2781,37 @@ describe('graph-tools', () => {
       const [path, options] = graphClient.graphRequest.mock.calls[0];
       expect(path).toBe('/me/photo/$value');
       expect(options.accessToken).toBeUndefined();
+      // The tool's contract is bytes: it must ask for binary handling regardless of
+      // the Content-Type Graph reports (application/msword is not on the allowlist).
+      expect(options.forceBinary).toBe(true);
+      expect(options.rawResponse).toBe(true);
+      expect(options.blobOutput).toBeUndefined();
+      expect(options.maxBytes).toBeUndefined();
+    });
+
+    it('asks for a capped blob resource when blob output is on', async () => {
+      mockEndpoints.length = 0;
+      mockEndpointsJson = [];
+      process.env.MS365_MCP_BLOB_OUTPUT = 'true';
+      process.env.MS365_MCP_BLOB_MAX_BYTES = '1234';
+      try {
+        const graphClient = { graphRequest: vi.fn().mockResolvedValue({ content: [] }) };
+        const server = createMockServer();
+        const { registerGraphTools } = await loadModule();
+        registerGraphTools(server as any, graphClient as any);
+
+        await server.tools
+          .get('download-bytes')!
+          .handler({ target: '/me/messages/m1/attachments/a1/$value', fileName: 'drawing.pdf' });
+
+        const [, options] = graphClient.graphRequest.mock.calls[0];
+        expect(options.forceBinary).toBe(true);
+        expect(options.maxBytes).toBe(1234);
+        expect(options.blobOutput).toEqual({ fileName: 'drawing.pdf' });
+      } finally {
+        delete process.env.MS365_MCP_BLOB_OUTPUT;
+        delete process.env.MS365_MCP_BLOB_MAX_BYTES;
+      }
     });
 
     it('rejects absolute URLs (Graph paths only)', async () => {
@@ -739,6 +2846,829 @@ describe('graph-tools', () => {
       expect(result.isError).toBe(true);
       const payload = JSON.parse(result.content[0].text);
       expect(payload.error).toMatch(/relative Microsoft Graph path/);
+    });
+  });
+
+  // ---- 9a. download-bytes-to-file utility tool ----
+  describe('download-bytes-to-file', () => {
+    let tmpDir: string;
+
+    beforeEach(() => {
+      tmpDir = mkdtempSync(join(tmpdir(), 'dbtf-'));
+    });
+
+    afterEach(() => {
+      rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    it('streams bytes to the output path and returns metadata', async () => {
+      mockEndpoints.length = 0;
+      mockEndpointsJson = [];
+
+      // downloadToFile is mocked here; binary-response.test.ts covers the real
+      // streaming + write. This just checks the tool wires the call and maps it.
+      const graphClient = {
+        downloadToFile: vi.fn().mockResolvedValue({
+          contentType: 'image/jpeg',
+          contentLength: 2,
+          httpStatus: 200,
+        }),
+      };
+
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      const tool = server.tools.get('download-bytes-to-file');
+      expect(tool).toBeDefined();
+
+      const outputPath = join(tmpDir, 'photo.jpg');
+      const result = await tool!.handler({ target: '/me/photo/$value', outputPath });
+
+      expect(graphClient.downloadToFile).toHaveBeenCalledTimes(1);
+      const [reqPath, dest, options] = graphClient.downloadToFile.mock.calls[0];
+      expect(reqPath).toBe('/me/photo/$value');
+      expect(dest).toBe(outputPath);
+      expect(options).toStrictEqual({ accessToken: undefined });
+
+      expect(result.isError).toBeUndefined();
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload).toEqual({ path: outputPath, contentType: 'image/jpeg', bytesWritten: 2 });
+      expect(result._meta).toMatchObject({ http_status: 200 });
+      expect(auditLogMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'tool.call',
+          tool: 'download-bytes-to-file',
+          status: 'success',
+          http_status: 200,
+        })
+      );
+    });
+
+    it('rejects a relative outputPath', async () => {
+      mockEndpoints.length = 0;
+      mockEndpointsJson = [];
+
+      const graphClient = { downloadToFile: vi.fn() };
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      const result = await server.tools
+        .get('download-bytes-to-file')!
+        .handler({ target: '/me/photo/$value', outputPath: 'relative/path.jpg' });
+
+      expect(result.isError).toBe(true);
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.error).toMatch(/absolute path/);
+      expect(graphClient.downloadToFile).not.toHaveBeenCalled();
+    });
+
+    it('rejects absolute URLs in target (Graph paths only)', async () => {
+      mockEndpoints.length = 0;
+      mockEndpointsJson = [];
+
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, {} as any);
+
+      const result = await server.tools.get('download-bytes-to-file')!.handler({
+        target: 'https://example.sharepoint.com/d/abc?temp=signed',
+        outputPath: join(tmpDir, 'x.bin'),
+      });
+
+      expect(result.isError).toBe(true);
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.error).toMatch(/relative Microsoft Graph path/);
+    });
+
+    it('refuses to overwrite an existing file and skips the Graph call', async () => {
+      mockEndpoints.length = 0;
+      mockEndpointsJson = [];
+
+      const outputPath = join(tmpDir, 'existing.bin');
+      writeFileSync(outputPath, 'original');
+
+      const graphClient = { downloadToFile: vi.fn() };
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      const result = await server.tools
+        .get('download-bytes-to-file')!
+        .handler({ target: '/me/photo/$value', outputPath });
+
+      expect(result.isError).toBe(true);
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.error).toMatch(/already exists/);
+      expect(graphClient.downloadToFile).not.toHaveBeenCalled();
+      // Original file is untouched.
+      expect(readFileSync(outputPath).toString('utf8')).toBe('original');
+    });
+
+    it('surfaces a Graph error when downloadToFile throws', async () => {
+      mockEndpoints.length = 0;
+      mockEndpointsJson = [];
+
+      // downloadToFile throws on Graph HTTP errors and cleans up any partial file
+      // itself; here we just check the tool surfaces the error.
+      const graphClient = {
+        downloadToFile: vi
+          .fn()
+          .mockRejectedValue(new Error('Microsoft Graph API error: 404 Not Found')),
+      };
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      const outputPath = join(tmpDir, 'missing.bin');
+      const result = await server.tools
+        .get('download-bytes-to-file')!
+        .handler({ target: '/me/messages/abc/attachments/xyz/$value', outputPath });
+
+      expect(result.isError).toBe(true);
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.error).toMatch(/404 Not Found/);
+    });
+
+    it('forwards the resolved account token to downloadToFile in multi-account mode', async () => {
+      mockEndpoints.length = 0;
+      mockEndpointsJson = [];
+
+      const graphClient = {
+        downloadToFile: vi
+          .fn()
+          .mockResolvedValue({ contentType: 'application/pdf', contentLength: 3 }),
+      };
+      const authManager = {
+        isOAuthModeEnabled: vi.fn().mockReturnValue(false),
+        getToken: vi.fn().mockResolvedValue(null),
+        getTokenForAccount: vi.fn().mockResolvedValue('account-2-token'),
+      };
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any, {
+        authManager: authManager as any,
+        multiAccount: true,
+        accountNames: ['user1@domain.com', 'user2@domain.com'],
+      });
+
+      const outputPath = join(tmpDir, 'invoice.pdf');
+      const result = await server.tools.get('download-bytes-to-file')!.handler({
+        target: '/me/messages/m1/attachments/a1/$value',
+        outputPath,
+        account: 'user2@domain.com',
+      });
+
+      expect(result.isError).toBeUndefined();
+      expect(authManager.getTokenForAccount).toHaveBeenCalledWith('user2@domain.com');
+      expect(graphClient.downloadToFile).toHaveBeenCalledWith(
+        '/me/messages/m1/attachments/a1/$value',
+        outputPath,
+        { accessToken: 'account-2-token' }
+      );
+    });
+
+    it('is registered in stdio mode but hidden in HTTP mode', async () => {
+      mockEndpoints.length = 0;
+      mockEndpointsJson = [];
+
+      const { registerGraphTools } = await loadModule();
+
+      const stdioServer = createMockServer();
+      registerGraphTools(stdioServer as any, {} as any);
+      expect(stdioServer.tools.has('download-bytes-to-file')).toBe(true);
+      // download-bytes remains available in both modes.
+      expect(stdioServer.tools.has('download-bytes')).toBe(true);
+
+      const httpServer = createMockServer();
+      // httpMode is the 10th positional arg.
+      registerGraphTools(httpServer as any, {} as any, { httpMode: true });
+      expect(httpServer.tools.has('download-bytes-to-file')).toBe(false);
+      expect(httpServer.tools.has('download-bytes')).toBe(true);
+    });
+  });
+
+  // ---- 9a2. upload-attachment-from-file utility tool ----
+  describe('upload-attachment-from-file', () => {
+    const TOOL = 'upload-attachment-from-file';
+    const TARGET = '/me/events/evt1/attachments';
+    let tmpDir: string;
+    let allowed: string;
+
+    beforeEach(() => {
+      mockEndpoints.length = 0;
+      mockEndpointsJson = [];
+      tmpDir = realpathSync(mkdtempSync(join(tmpdir(), 'uaff-')));
+      allowed = join(tmpDir, 'allowed');
+      mkdirSync(allowed);
+      process.env.MS365_MCP_UPLOAD_DIRS = allowed;
+    });
+
+    afterEach(() => {
+      delete process.env.MS365_MCP_UPLOAD_DIRS;
+      vi.unstubAllGlobals();
+      rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    async function register(graphClient: unknown, options?: Record<string, unknown>) {
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any, options as any);
+      return server;
+    }
+
+    it('is not registered unless MS365_MCP_UPLOAD_DIRS is set', async () => {
+      delete process.env.MS365_MCP_UPLOAD_DIRS;
+      const server = await register({});
+      expect(server.tools.has(TOOL)).toBe(false);
+      expect(server.tools.has('download-bytes-to-file')).toBe(true);
+    });
+
+    it('is not registered in read-only mode or over HTTP', async () => {
+      expect((await register({}, { readOnly: true })).tools.has(TOOL)).toBe(false);
+      expect((await register({}, { httpMode: true })).tools.has(TOOL)).toBe(false);
+    });
+
+    it('attaches a small file inline, named after the file', async () => {
+      const bytes = Buffer.from([0x25, 0x50, 0x44, 0x46, 0x00, 0xff]);
+      writeFileSync(join(allowed, 'invitation.pdf'), bytes);
+      const graphClient = { makeRequest: vi.fn().mockResolvedValue({ id: 'att1' }) };
+      const server = await register(graphClient);
+
+      const result = await server.tools
+        .get(TOOL)!
+        .handler({ target: TARGET, filePath: join(allowed, 'invitation.pdf') });
+
+      expect(result.isError).toBeUndefined();
+      expect(JSON.parse(result.content[0].text)).toEqual({
+        name: 'invitation.pdf',
+        size: bytes.length,
+        id: 'att1',
+      });
+      expect(graphClient.makeRequest).toHaveBeenCalledTimes(1);
+      const [reqPath, options] = graphClient.makeRequest.mock.calls[0];
+      expect(reqPath).toBe(TARGET);
+      expect(options.method).toBe('POST');
+      expect(JSON.parse(options.body)).toEqual({
+        '@odata.type': '#microsoft.graph.fileAttachment',
+        name: 'invitation.pdf',
+        contentType: 'application/octet-stream',
+        contentBytes: bytes.toString('base64'),
+      });
+      expect(auditLogMock).toHaveBeenCalledWith(
+        expect.objectContaining({ event: 'tool.call', tool: TOOL, status: 'success' })
+      );
+    });
+
+    it('uses the given name and content type', async () => {
+      writeFileSync(join(allowed, 'scan-0042.bin'), 'x');
+      const graphClient = { makeRequest: vi.fn().mockResolvedValue({ id: 'att1' }) };
+      const server = await register(graphClient);
+
+      await server.tools.get(TOOL)!.handler({
+        target: '/me/messages/msg1/attachments',
+        filePath: join(allowed, 'scan-0042.bin'),
+        name: 'flyer.pdf',
+        contentType: 'application/pdf',
+      });
+
+      const body = JSON.parse(graphClient.makeRequest.mock.calls[0][1].body);
+      expect(body.name).toBe('flyer.pdf');
+      expect(body.contentType).toBe('application/pdf');
+    });
+
+    it('sends a file of 3 MB or more through an upload session in chunks', async () => {
+      const size = 4 * 1024 * 1024 + 123;
+      const bytes = Buffer.alloc(size, 7);
+      writeFileSync(join(allowed, 'big.bin'), bytes);
+      const graphClient = {
+        makeRequest: vi.fn().mockResolvedValue({ uploadUrl: 'https://upload.example/session' }),
+      };
+      const ranges: string[] = [];
+      let uploaded = 0;
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(
+          async (_url: string, init: { headers: Record<string, string>; body: ArrayBuffer }) => {
+            ranges.push(init.headers['Content-Range']);
+            uploaded += init.body.byteLength;
+            return new Response(null, { status: 202 });
+          }
+        )
+      );
+      const server = await register(graphClient);
+
+      const result = await server.tools
+        .get(TOOL)!
+        .handler({ target: TARGET, filePath: join(allowed, 'big.bin') });
+
+      expect(result.isError).toBeUndefined();
+      expect(JSON.parse(result.content[0].text)).toEqual({ name: 'big.bin', size });
+      const [reqPath, options] = graphClient.makeRequest.mock.calls[0];
+      expect(reqPath).toBe(`${TARGET}/createUploadSession`);
+      expect(JSON.parse(options.body).AttachmentItem).toMatchObject({ name: 'big.bin', size });
+      const chunk = 320 * 1024 * 12;
+      expect(ranges).toEqual([
+        `bytes 0-${chunk - 1}/${size}`,
+        `bytes ${chunk}-${size - 1}/${size}`,
+      ]);
+      expect(uploaded).toBe(size);
+    });
+
+    it('refuses a file outside the allowed directories, also through a symlink', async () => {
+      writeFileSync(join(tmpDir, 'secret.txt'), 'secret');
+      symlinkSync(join(tmpDir, 'secret.txt'), join(allowed, 'link.txt'));
+      const graphClient = { makeRequest: vi.fn() };
+      const server = await register(graphClient);
+
+      for (const filePath of [join(tmpDir, 'secret.txt'), join(allowed, 'link.txt')]) {
+        const result = await server.tools.get(TOOL)!.handler({ target: TARGET, filePath });
+        expect(result.isError).toBe(true);
+        expect(JSON.parse(result.content[0].text).error).toMatch(/does not exist or is outside/);
+      }
+      expect(graphClient.makeRequest).not.toHaveBeenCalled();
+    });
+
+    it('refuses an empty file and a target that is not an attachments collection', async () => {
+      writeFileSync(join(allowed, 'empty.txt'), '');
+      writeFileSync(join(allowed, 'a.txt'), 'a');
+      const graphClient = { makeRequest: vi.fn() };
+      const server = await register(graphClient);
+      const call = async (args: Record<string, unknown>) =>
+        JSON.parse((await server.tools.get(TOOL)!.handler(args)).content[0].text).error;
+
+      expect(await call({ target: TARGET, filePath: join(allowed, 'empty.txt') })).toMatch(
+        /file is empty/
+      );
+      expect(
+        await call({ target: '/me/drive/root:/a.txt:/content', filePath: join(allowed, 'a.txt') })
+      ).toMatch(/attachments collection/);
+      expect(graphClient.makeRequest).not.toHaveBeenCalled();
+    });
+
+    it('answers a Graph failure as a tool error', async () => {
+      writeFileSync(join(allowed, 'a.txt'), 'a');
+      const graphClient = { makeRequest: vi.fn().mockRejectedValue(new Error('Graph said no')) };
+      const server = await register(graphClient);
+
+      const result = await server.tools
+        .get(TOOL)!
+        .handler({ target: TARGET, filePath: join(allowed, 'a.txt') });
+
+      expect(result.isError).toBe(true);
+      expect(JSON.parse(result.content[0].text).error).toBe('Graph said no');
+    });
+  });
+
+  // ---- 9b. get-download-url utility tool ----
+  describe('get-download-url', () => {
+    it('strips /content, fetches item metadata, and returns the pre-authed downloadUrl', async () => {
+      mockEndpoints.length = 0;
+      mockEndpointsJson = [];
+
+      const downloadUrl = 'https://contoso.sharepoint.com/download.aspx?tempauth=abc';
+      const graphClient = {
+        graphRequest: vi.fn().mockResolvedValue({
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                id: 'item1',
+                name: 'report.pdf',
+                size: 12727,
+                file: { mimeType: 'application/pdf' },
+                '@microsoft.graph.downloadUrl': downloadUrl,
+              }),
+            },
+          ],
+          _meta: { http_status: 200 },
+        }),
+      };
+
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      const tool = server.tools.get('get-download-url');
+      expect(tool).toBeDefined();
+
+      const result = await tool!.handler({
+        target: '/drives/d1/items/item1/content',
+      });
+
+      // /content is stripped before fetching the item metadata.
+      const [requestedPath] = graphClient.graphRequest.mock.calls[0];
+      expect(requestedPath).toBe('/drives/d1/items/item1');
+
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.downloadUrl).toBe(downloadUrl);
+      expect(payload.name).toBe('report.pdf');
+      expect(payload.size).toBe(12727);
+      expect(payload.contentType).toBe('application/pdf');
+      expect(result._meta).toMatchObject({ http_status: 200 });
+      expect(auditLogMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'tool.call',
+          tool: 'get-download-url',
+          status: 'success',
+          http_status: 200,
+        })
+      );
+    });
+
+    it('forces a JSON body on the metadata request so it works under --toon (#560)', async () => {
+      mockEndpoints.length = 0;
+      mockEndpointsJson = [];
+
+      const graphClient = {
+        graphRequest: vi.fn().mockResolvedValue({
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({ '@microsoft.graph.downloadUrl': 'https://dl.example/x' }),
+            },
+          ],
+        }),
+      };
+
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      const result = await server.tools
+        .get('get-download-url')!
+        .handler({ target: '/drives/d1/items/item1/content' });
+
+      // Without forceJsonOutput the client would TOON-encode the metadata and the
+      // handler's JSON.parse would fail, masking a valid item as "no download url".
+      const [, opts] = graphClient.graphRequest.mock.calls[0];
+      expect(opts?.forceJsonOutput).toBe(true);
+      expect(JSON.parse(result.content[0].text).downloadUrl).toBe('https://dl.example/x');
+    });
+
+    it('rejects query-shaped targets instead of silently changing request semantics', async () => {
+      mockEndpoints.length = 0;
+      mockEndpointsJson = [];
+
+      const graphClient = { graphRequest: vi.fn() };
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      const tool = server.tools.get('get-download-url');
+      const result = await tool!.handler({
+        target: '/drives/d1/items/item1/content?$select=id,name',
+      });
+
+      expect(result.isError).toBe(true);
+      expect(graphClient.graphRequest).not.toHaveBeenCalled();
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.error).toContain('must not include query parameters');
+    });
+
+    it('rejects non-drive Graph targets before making an authenticated request', async () => {
+      mockEndpoints.length = 0;
+      mockEndpointsJson = [];
+
+      const graphClient = { graphRequest: vi.fn() };
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      const tool = server.tools.get('get-download-url');
+      const result = await tool!.handler({
+        target: '/me/messages/m1',
+      });
+
+      expect(result.isError).toBe(true);
+      expect(graphClient.graphRequest).not.toHaveBeenCalled();
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.error).toContain('target must identify a driveItem');
+    });
+
+    it('rejects mail attachment $value paths (no pre-authed URL exists)', async () => {
+      mockEndpoints.length = 0;
+      mockEndpointsJson = [];
+
+      const graphClient = { graphRequest: vi.fn() };
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      const tool = server.tools.get('get-download-url');
+      const result = await tool!.handler({
+        target: '/me/messages/m1/attachments/a1/$value',
+      });
+
+      expect(result.isError).toBe(true);
+      expect(graphClient.graphRequest).not.toHaveBeenCalled();
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.error).toMatch(/do not expose a pre-authenticated download URL/);
+    });
+
+    it('rejects calendar event attachment $value paths (no pre-authed URL exists)', async () => {
+      mockEndpoints.length = 0;
+      mockEndpointsJson = [];
+
+      const graphClient = { graphRequest: vi.fn() };
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      const tool = server.tools.get('get-download-url');
+      const result = await tool!.handler({
+        target: '/me/events/e1/attachments/a1/$value',
+      });
+
+      expect(result.isError).toBe(true);
+      expect(graphClient.graphRequest).not.toHaveBeenCalled();
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.error).toMatch(/Mail and calendar event attachments/);
+    });
+
+    it('rejects group mailbox attachment paths (no pre-authed URL exists)', async () => {
+      mockEndpoints.length = 0;
+      mockEndpointsJson = [];
+
+      const graphClient = { graphRequest: vi.fn() };
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      const tool = server.tools.get('get-download-url');
+      const result = await tool!.handler({
+        target: '/groups/g1/messages/m1/attachments/a1/$value',
+      });
+
+      expect(result.isError).toBe(true);
+      expect(graphClient.graphRequest).not.toHaveBeenCalled();
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.error).toMatch(/Mail and calendar event attachments/);
+    });
+
+    it('rejects list-item driveItem relationships until callers provide a drive item path', async () => {
+      mockEndpoints.length = 0;
+      mockEndpointsJson = [];
+
+      const graphClient = { graphRequest: vi.fn() };
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      const tool = server.tools.get('get-download-url');
+      const result = await tool!.handler({
+        target: '/sites/site1/lists/list1/items/item1/driveItem',
+      });
+
+      expect(result.isError).toBe(true);
+      expect(graphClient.graphRequest).not.toHaveBeenCalled();
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.error).toContain('target must identify a driveItem');
+    });
+
+    it('errors when the resource exposes no downloadUrl', async () => {
+      mockEndpoints.length = 0;
+      mockEndpointsJson = [];
+
+      const graphClient = {
+        graphRequest: vi.fn().mockResolvedValue({
+          content: [{ type: 'text', text: JSON.stringify({ id: 'item1', name: 'x' }) }],
+        }),
+      };
+
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      const tool = server.tools.get('get-download-url');
+      const result = await tool!.handler({ target: '/drives/d1/items/item1' });
+
+      expect(result.isError).toBe(true);
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.error).toMatch(/No pre-authenticated download URL/);
+    });
+
+    it('surfaces the underlying Graph error instead of masking it as no-downloadUrl', async () => {
+      mockEndpoints.length = 0;
+      mockEndpointsJson = [];
+
+      // graphRequest catches Graph HTTP errors internally and returns { isError: true }.
+      const graphClient = {
+        graphRequest: vi.fn().mockResolvedValue({
+          isError: true,
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({ error: 'Microsoft Graph API error: 403 Forbidden' }),
+            },
+          ],
+        }),
+      };
+
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      const tool = server.tools.get('get-download-url');
+      const result = await tool!.handler({ target: '/drives/d1/items/item1/content' });
+
+      expect(result.isError).toBe(true);
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.error).toMatch(/403 Forbidden/);
+      expect(payload.error).not.toMatch(/No pre-authenticated download URL/);
+    });
+
+    it('does not falsely reject drive folders literally named "attachments"', async () => {
+      mockEndpoints.length = 0;
+      mockEndpointsJson = [];
+
+      const downloadUrl = 'https://contoso.sharepoint.com/download.aspx?tempauth=xyz';
+      const graphClient = {
+        graphRequest: vi.fn().mockResolvedValue({
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                name: 'report.pdf',
+                '@microsoft.graph.downloadUrl': downloadUrl,
+              }),
+            },
+          ],
+        }),
+      };
+
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      const tool = server.tools.get('get-download-url');
+      const result = await tool!.handler({
+        target: '/me/drive/root:/Project/attachments/report.pdf:/content',
+      });
+
+      expect(result.isError).toBeFalsy();
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.downloadUrl).toBe(downloadUrl);
+    });
+
+    it('does not falsely reject drive item paths containing messages and attachments folders', async () => {
+      mockEndpoints.length = 0;
+      mockEndpointsJson = [];
+
+      const downloadUrl = 'https://contoso.sharepoint.com/download.aspx?tempauth=folders';
+      const graphClient = {
+        graphRequest: vi.fn().mockResolvedValue({
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                name: 'report.pdf',
+                '@microsoft.graph.downloadUrl': downloadUrl,
+              }),
+            },
+          ],
+        }),
+      };
+
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      const tool = server.tools.get('get-download-url');
+      const result = await tool!.handler({
+        target: '/me/drive/root:/messages/m1/attachments/a1/report.pdf:/content',
+      });
+
+      expect(result.isError).toBeFalsy();
+      const [requestedPath] = graphClient.graphRequest.mock.calls[0];
+      expect(requestedPath).toBe('/me/drive/root:/messages/m1/attachments/a1/report.pdf:');
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.downloadUrl).toBe(downloadUrl);
+    });
+
+    it('allows SharePoint site drive item paths', async () => {
+      mockEndpoints.length = 0;
+      mockEndpointsJson = [];
+
+      const downloadUrl = 'https://contoso.sharepoint.com/download.aspx?tempauth=site-drive';
+      const graphClient = {
+        graphRequest: vi.fn().mockResolvedValue({
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                name: 'site-report.pdf',
+                '@microsoft.graph.downloadUrl': downloadUrl,
+              }),
+            },
+          ],
+        }),
+      };
+
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      const tool = server.tools.get('get-download-url');
+      const result = await tool!.handler({
+        target: '/sites/site1/drive/items/item1/content',
+      });
+
+      expect(result.isError).toBeFalsy();
+      const [requestedPath] = graphClient.graphRequest.mock.calls[0];
+      expect(requestedPath).toBe('/sites/site1/drive/items/item1');
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.downloadUrl).toBe(downloadUrl);
+    });
+
+    it('does not strip a drive item path whose item name is content', async () => {
+      mockEndpoints.length = 0;
+      mockEndpointsJson = [];
+
+      const downloadUrl = 'https://contoso.sharepoint.com/download.aspx?tempauth=content-file';
+      const graphClient = {
+        graphRequest: vi.fn().mockResolvedValue({
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                name: 'content',
+                '@microsoft.graph.downloadUrl': downloadUrl,
+              }),
+            },
+          ],
+        }),
+      };
+
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      const tool = server.tools.get('get-download-url');
+      const result = await tool!.handler({
+        target: '/me/drive/root:/Project/content:',
+      });
+
+      expect(result.isError).toBeFalsy();
+      const [requestedPath] = graphClient.graphRequest.mock.calls[0];
+      expect(requestedPath).toBe('/me/drive/root:/Project/content:');
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.downloadUrl).toBe(downloadUrl);
+    });
+
+    it('rejects meeting recording content paths because Graph returns authenticated bytes', async () => {
+      mockEndpoints.length = 0;
+      mockEndpointsJson = [];
+
+      const graphClient = { graphRequest: vi.fn() };
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      const tool = server.tools.get('get-download-url');
+      const result = await tool!.handler({
+        target: '/me/onlineMeetings/meeting1/recordings/recording1/content',
+      });
+
+      expect(result.isError).toBe(true);
+      expect(graphClient.graphRequest).not.toHaveBeenCalled();
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.error).toMatch(/Meeting recordings do not expose/);
+    });
+
+    it('refuses mismatched account param in bearer mode before resolving download URL', async () => {
+      mockEndpoints.length = 0;
+      mockEndpointsJson = [];
+
+      const graphClient = { graphRequest: vi.fn() };
+      const authManager = {
+        isOAuthModeEnabled: vi.fn().mockReturnValue(false),
+        getToken: vi.fn().mockResolvedValue(null),
+        getTokenForAccount: vi.fn(),
+      };
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any, {
+        authManager: authManager as any,
+        multiAccount: true,
+        accountNames: ['user1@domain.com', 'user2@domain.com'],
+      });
+      const { requestContext } = await import('../request-context.js');
+
+      const tool = server.tools.get('get-download-url');
+      const bearer = makeJwt({ upn: 'user1@domain.com' });
+      const result = await requestContext.run({ accessToken: bearer }, () =>
+        tool!.handler({
+          target: '/drives/d1/items/item1/content',
+          account: 'user2@domain.com',
+        })
+      );
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("'account' parameter is not supported");
+      expect(graphClient.graphRequest).not.toHaveBeenCalled();
+      expect(authManager.getTokenForAccount).not.toHaveBeenCalled();
     });
   });
 
@@ -778,20 +3708,67 @@ describe('graph-tools', () => {
 
       const server = createMockServer();
       const { registerGraphTools } = await loadModule();
-      registerGraphTools(
-        server as any,
-        createMockGraphClient() as any,
-        false,
-        undefined,
-        false,
-        undefined,
-        false,
-        [],
-        'Mail.Read'
-      );
+      registerGraphTools(server as any, createMockGraphClient() as any, {
+        allowedScopes: 'Mail.Read',
+      });
 
       expect(server.tools.has('list-mail-messages')).toBe(true);
       expect(server.tools.has('list-calendar-events')).toBe(false);
+    });
+
+    it('audits direct calls to Graph tools denied by allowed scopes', async () => {
+      mockEndpoints.push({
+        alias: 'get-drive-item',
+        method: 'get',
+        path: '/drives/:driveId/items/:driveItemId',
+        description: 'Get drive item',
+        parameters: [
+          { name: 'driveId', type: 'Path', schema: z.string() },
+          { name: 'driveItemId', type: 'Path', schema: z.string() },
+        ],
+      });
+      mockEndpointsJson = [
+        {
+          toolName: 'get-drive-item',
+          method: 'get',
+          pathPattern: '/drives/{drive-id}/items/{driveItem-id}',
+          scopes: ['Files.Read'],
+        },
+      ];
+
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, createMockGraphClient() as any, {
+        allowedScopes: 'Mail.Read',
+      });
+      const handler = server.server._requestHandlers.get('tools/call');
+
+      await expect(
+        handler?.(
+          {
+            method: 'tools/call',
+            params: {
+              name: 'get-drive-item',
+              arguments: { driveId: 'drive-1', driveItemId: 'item-2' },
+            },
+          },
+          {}
+        )
+      ).rejects.toThrow(/not found/);
+
+      expect(auditLogMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'tool.denied',
+          tool: 'get-drive-item',
+          status: 'denied',
+          reason: 'allowed_scopes',
+          missing_scopes: ['Files.Read'],
+          target_resource: {
+            type: 'drive_item',
+            id: '/drives/drive-1/items/item-2',
+          },
+        })
+      );
     });
 
     it('discovery hides Graph tools outside the allowed scopes', async () => {
@@ -828,22 +3805,111 @@ describe('graph-tools', () => {
 
       const server = createMockServer();
       const { registerDiscoveryTools } = await loadModule();
-      registerDiscoveryTools(
-        server as any,
-        {} as any,
-        false,
-        false,
-        undefined,
-        false,
-        [],
-        undefined,
-        'Mail.Read'
-      );
+      registerDiscoveryTools(server as any, {} as any, { allowedScopes: 'Mail.Read' });
 
       const result = await server.tools.get('search-tools')!.handler({ limit: 50 });
       const found = JSON.parse(result.content[0].text).tools.map((t: any) => t.name);
       expect(found).toContain('list-mail-messages');
       expect(found).not.toContain('list-calendar-events');
+    });
+
+    it('audits execute-tool attempts denied by allowed scopes', async () => {
+      mockEndpoints.push({
+        alias: 'get-drive-item',
+        method: 'get',
+        path: '/drives/:driveId/items/:driveItemId',
+        description: 'Get drive item',
+        parameters: [
+          { name: 'driveId', type: 'Path', schema: z.string() },
+          { name: 'driveItemId', type: 'Path', schema: z.string() },
+        ],
+      });
+      mockEndpointsJson = [
+        {
+          toolName: 'get-drive-item',
+          method: 'get',
+          pathPattern: '/drives/{drive-id}/items/{driveItem-id}',
+          scopes: ['Files.Read'],
+        },
+      ];
+
+      const server = createMockServer();
+      const { registerDiscoveryTools } = await loadModule();
+      registerDiscoveryTools(server as any, {} as any, { allowedScopes: 'Mail.Read' });
+
+      const result = await server.tools.get('execute-tool')!.handler({
+        tool_name: 'get-drive-item',
+        parameters: { driveId: 'drive-1', driveItemId: 'item-2' },
+      });
+
+      expect(result.isError).toBe(true);
+      expect(JSON.parse(result.content[0].text).error).toMatch(/not found/i);
+      expect(auditLogMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'tool.denied',
+          tool: 'get-drive-item',
+          status: 'denied',
+          reason: 'allowed_scopes',
+          missing_scopes: ['Files.Read'],
+          target_resource: {
+            type: 'drive_item',
+            id: '/drives/drive-1/items/item-2',
+          },
+        })
+      );
+    });
+
+    it('audits direct discovery-mode calls to Graph tools denied by allowed scopes', async () => {
+      mockEndpoints.push({
+        alias: 'get-drive-item',
+        method: 'get',
+        path: '/drives/:driveId/items/:driveItemId',
+        description: 'Get drive item',
+        parameters: [
+          { name: 'driveId', type: 'Path', schema: z.string() },
+          { name: 'driveItemId', type: 'Path', schema: z.string() },
+        ],
+      });
+      mockEndpointsJson = [
+        {
+          toolName: 'get-drive-item',
+          method: 'get',
+          pathPattern: '/drives/{drive-id}/items/{driveItem-id}',
+          scopes: ['Files.Read'],
+        },
+      ];
+
+      const server = createMockServer();
+      const { registerDiscoveryTools } = await loadModule();
+      registerDiscoveryTools(server as any, {} as any, { allowedScopes: 'Mail.Read' });
+      const handler = server.server._requestHandlers.get('tools/call');
+
+      await expect(
+        handler?.(
+          {
+            method: 'tools/call',
+            params: {
+              name: 'get-drive-item',
+              arguments: { driveId: 'drive-1', driveItemId: 'item-2' },
+            },
+          },
+          {}
+        )
+      ).rejects.toThrow(/not found/);
+
+      expect(auditLogMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'tool.denied',
+          tool: 'get-drive-item',
+          status: 'denied',
+          reason: 'allowed_scopes',
+          missing_scopes: ['Files.Read'],
+          target_resource: {
+            type: 'drive_item',
+            id: '/drives/drive-1/items/item-2',
+          },
+        })
+      );
     });
   });
 
@@ -880,6 +3946,9 @@ describe('graph-tools', () => {
       const targetParam = schema.parameters.find((p: any) => p.name === 'target');
       expect(targetParam).toBeDefined();
       expect(targetParam.required).toBe(true);
+      expect(targetParam.description).toContain('authenticated recording bytes');
+      expect(targetParam.description).not.toContain('returns a URL');
+      expect(schema.description).toContain('For large drive/SharePoint file content');
     });
 
     it('execute-tool dispatches to download-bytes for a Graph path', async () => {
@@ -960,12 +4029,66 @@ describe('graph-tools', () => {
 
       const server = createMockServer();
       const { registerDiscoveryTools } = await loadModule();
-      registerDiscoveryTools(server as any, {} as any, false, false, undefined, false, [], 'mail');
+      registerDiscoveryTools(server as any, {} as any, { enabledTools: 'mail' });
 
       const result = await server.tools.get('search-tools')!.handler({ limit: 50 });
       const found = JSON.parse(result.content[0].text).tools.map((t: any) => t.name);
       expect(found).toContain('list-mail-messages');
       expect(found).not.toContain('list-calendar-events');
+    });
+
+    it('audits execute-tool attempts denied by the enabled-tools allow-list', async () => {
+      mockEndpoints.push(
+        {
+          alias: 'get-drive-item',
+          method: 'get',
+          path: '/drives/:driveId/items/:driveItemId',
+          description: 'Get drive item',
+          parameters: [
+            { name: 'driveId', type: 'Path', schema: z.string() },
+            { name: 'driveItemId', type: 'Path', schema: z.string() },
+          ],
+        },
+        {
+          alias: 'list-mail-messages',
+          method: 'get',
+          path: '/me/messages',
+          description: 'List mail',
+          parameters: [],
+        }
+      );
+      mockEndpointsJson = [
+        {
+          toolName: 'get-drive-item',
+          method: 'get',
+          pathPattern: '/drives/{drive-id}/items/{driveItem-id}',
+        },
+        { toolName: 'list-mail-messages', method: 'get', pathPattern: '/me/messages' },
+      ];
+
+      const server = createMockServer();
+      const { registerDiscoveryTools } = await loadModule();
+      registerDiscoveryTools(server as any, {} as any, { enabledTools: '^list-mail-messages$' });
+
+      const result = await server.tools.get('execute-tool')!.handler({
+        tool_name: 'get-drive-item',
+        parameters: { driveId: 'drive-1', driveItemId: 'item-2' },
+      });
+
+      expect(result.isError).toBe(true);
+      expect(JSON.parse(result.content[0].text).error).toMatch(/not found/i);
+      expect(auditLogMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'tool.denied',
+          tool: 'get-drive-item',
+          status: 'denied',
+          reason: 'tool_allowlist',
+          target_resource: {
+            type: 'drive_item',
+            id: '/drives/drive-1/items/item-2',
+          },
+        })
+      );
     });
 
     it('utility tools obey the regex too', async () => {
@@ -974,16 +4097,7 @@ describe('graph-tools', () => {
 
       const server = createMockServer();
       const { registerDiscoveryTools } = await loadModule();
-      registerDiscoveryTools(
-        server as any,
-        {} as any,
-        false,
-        false,
-        undefined,
-        false,
-        [],
-        '^download-bytes$'
-      );
+      registerDiscoveryTools(server as any, {} as any, { enabledTools: '^download-bytes$' });
 
       const result = await server.tools.get('search-tools')!.handler({ limit: 50 });
       const found = JSON.parse(result.content[0].text).tools.map((t: any) => t.name);
@@ -997,16 +4111,7 @@ describe('graph-tools', () => {
 
       const server = createMockServer();
       const { registerDiscoveryTools } = await loadModule();
-      registerDiscoveryTools(
-        server as any,
-        {} as any,
-        false,
-        false,
-        undefined,
-        false,
-        [],
-        '[invalid'
-      );
+      registerDiscoveryTools(server as any, {} as any, { enabledTools: '[invalid' });
 
       const result = await server.tools.get('search-tools')!.handler({ limit: 50 });
       const found = JSON.parse(result.content[0].text).tools.map((t: any) => t.name);
@@ -1023,12 +4128,1469 @@ describe('graph-tools', () => {
 
       const server = createMockServer();
       const { registerGraphTools } = await loadModule();
-      registerGraphTools(server as any, {} as any, true);
+      registerGraphTools(server as any, {} as any, { readOnly: true });
 
       // Both built-in utility tools (download-bytes, parse-teams-url) have
       // readOnlyHint: true so they should be present.
       expect(server.tools.has('download-bytes')).toBe(true);
       expect(server.tools.has('parse-teams-url')).toBe(true);
+    });
+  });
+
+  // ---- destructive-operation confirm: true gate (CT-03) ----
+  describe('destructive operations require confirm: true', () => {
+    const prevRequireConfirm = process.env.MS365_MCP_REQUIRE_CONFIRM;
+
+    beforeEach(() => {
+      // The confirm gate is opt-in (off by default); enable it for the
+      // gate-behaviour tests below. The default-off case is asserted explicitly.
+      process.env.MS365_MCP_REQUIRE_CONFIRM = 'true';
+    });
+
+    afterEach(() => {
+      if (prevRequireConfirm === undefined) delete process.env.MS365_MCP_REQUIRE_CONFIRM;
+      else process.env.MS365_MCP_REQUIRE_CONFIRM = prevRequireConfirm;
+    });
+
+    it('rejects DELETE without confirm: true and does NOT call Graph', async () => {
+      const endpoint = makeEndpoint({
+        method: 'delete',
+        path: '/me/messages/:message-id',
+        alias: 'delete-mail-message',
+      });
+      const config = makeConfig({
+        pathPattern: '/me/messages/{message-id}',
+        method: 'delete',
+        toolName: 'delete-mail-message',
+      });
+      mockEndpoints.push(endpoint);
+      mockEndpointsJson = [config];
+
+      const graphClient = createMockGraphClient();
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      const tool = server.tools.get('delete-mail-message');
+      const result: any = await tool!.handler({ messageId: 'abc' });
+
+      expect(graphClient.graphRequest).not.toHaveBeenCalled();
+      expect(result.isError).toBe(true);
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.error).toBe('confirmation_required');
+      expect(payload.tool).toBe('delete-mail-message');
+      expect(payload.destructive).toBe(true);
+    });
+
+    it('allows DELETE when confirm: true is passed', async () => {
+      const endpoint = makeEndpoint({
+        method: 'delete',
+        path: '/me/messages/:message-id',
+        alias: 'delete-mail-message',
+      });
+      const config = makeConfig({
+        pathPattern: '/me/messages/{message-id}',
+        method: 'delete',
+        toolName: 'delete-mail-message',
+      });
+      mockEndpoints.push(endpoint);
+      mockEndpointsJson = [config];
+
+      const graphClient = createMockGraphClient([
+        { content: [{ type: 'text', text: JSON.stringify({ status: 204 }) }] },
+      ]);
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      const tool = server.tools.get('delete-mail-message');
+      await tool!.handler({ messageId: 'abc', confirm: true });
+
+      expect(graphClient.graphRequest).toHaveBeenCalledTimes(1);
+    });
+
+    it('does NOT send `confirm` to Graph as a query/body parameter', async () => {
+      const endpoint = makeEndpoint({
+        method: 'post',
+        path: '/me/sendMail',
+        alias: 'send-mail',
+        parameters: [{ name: 'message', type: 'Body', schema: z.any() }],
+      });
+      const config = makeConfig({
+        pathPattern: '/me/sendMail',
+        method: 'post',
+        toolName: 'send-mail',
+      });
+      mockEndpoints.push(endpoint);
+      mockEndpointsJson = [config];
+
+      const graphClient = createMockGraphClient([
+        { content: [{ type: 'text', text: JSON.stringify({ status: 202 }) }] },
+      ]);
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      const tool = server.tools.get('send-mail');
+      await tool!.handler({ message: { subject: 'hi' }, confirm: true });
+
+      const [url, opts] = graphClient.graphRequest.mock.calls[0];
+      expect(url).not.toContain('confirm');
+      // Body should be the message object, no `confirm` leaked
+      const body = JSON.parse(opts.body);
+      expect(body).not.toHaveProperty('confirm');
+    });
+
+    it('allows GET (read-only) regardless of confirm', async () => {
+      const endpoint = makeEndpoint(); // default is GET
+      const config = makeConfig();
+      mockEndpoints.push(endpoint);
+      mockEndpointsJson = [config];
+
+      const graphClient = createMockGraphClient([
+        { content: [{ type: 'text', text: JSON.stringify({ value: [] }) }] },
+      ]);
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      const tool = server.tools.get('test-tool');
+      await tool!.handler({}); // No confirm
+      expect(graphClient.graphRequest).toHaveBeenCalledTimes(1);
+    });
+
+    it('allows POST endpoints flagged readOnly without confirm (e.g. find-meeting-times)', async () => {
+      const endpoint = makeEndpoint({
+        method: 'post',
+        path: '/me/findMeetingTimes',
+        alias: 'find-meeting-times',
+      });
+      const config = makeConfig({
+        pathPattern: '/me/findMeetingTimes',
+        method: 'post',
+        toolName: 'find-meeting-times',
+        readOnly: true,
+      });
+      mockEndpoints.push(endpoint);
+      mockEndpointsJson = [config];
+
+      const graphClient = createMockGraphClient([
+        { content: [{ type: 'text', text: JSON.stringify({ meetingTimeSuggestions: [] }) }] },
+      ]);
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      const tool = server.tools.get('find-meeting-times');
+      await tool!.handler({});
+      expect(graphClient.graphRequest).toHaveBeenCalledTimes(1);
+    });
+
+    it('does NOT gate when MS365_MCP_REQUIRE_CONFIRM is unset (opt-in, off by default)', async () => {
+      delete process.env.MS365_MCP_REQUIRE_CONFIRM;
+      const endpoint = makeEndpoint({
+        method: 'delete',
+        path: '/me/messages/:message-id',
+        alias: 'delete-mail-message',
+      });
+      const config = makeConfig({
+        pathPattern: '/me/messages/{message-id}',
+        method: 'delete',
+        toolName: 'delete-mail-message',
+      });
+      mockEndpoints.push(endpoint);
+      mockEndpointsJson = [config];
+
+      const graphClient = createMockGraphClient([
+        { content: [{ type: 'text', text: JSON.stringify({ status: 204 }) }] },
+      ]);
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      const tool = server.tools.get('delete-mail-message');
+      await tool!.handler({ messageId: 'abc' }); // No confirm — gate off by default
+      expect(graphClient.graphRequest).toHaveBeenCalledTimes(1);
+    });
+
+    it('does NOT gate when MS365_MCP_REQUIRE_CONFIRM=false (explicit off)', async () => {
+      process.env.MS365_MCP_REQUIRE_CONFIRM = 'false';
+      const endpoint = makeEndpoint({
+        method: 'delete',
+        path: '/me/messages/:message-id',
+        alias: 'delete-mail-message',
+      });
+      const config = makeConfig({
+        pathPattern: '/me/messages/{message-id}',
+        method: 'delete',
+        toolName: 'delete-mail-message',
+      });
+      mockEndpoints.push(endpoint);
+      mockEndpointsJson = [config];
+
+      const graphClient = createMockGraphClient([
+        { content: [{ type: 'text', text: JSON.stringify({ status: 204 }) }] },
+      ]);
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      const tool = server.tools.get('delete-mail-message');
+      await tool!.handler({ messageId: 'abc' }); // No confirm
+      expect(graphClient.graphRequest).toHaveBeenCalledTimes(1);
+    });
+
+    it('rejects `confirm: false` as not equal to true', async () => {
+      const endpoint = makeEndpoint({
+        method: 'patch',
+        path: '/me/messages/:message-id',
+        alias: 'update-mail-message',
+      });
+      const config = makeConfig({
+        pathPattern: '/me/messages/{message-id}',
+        method: 'patch',
+        toolName: 'update-mail-message',
+      });
+      mockEndpoints.push(endpoint);
+      mockEndpointsJson = [config];
+
+      const graphClient = createMockGraphClient();
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      const tool = server.tools.get('update-mail-message');
+      const result: any = await tool!.handler({ messageId: 'abc', confirm: false });
+      expect(graphClient.graphRequest).not.toHaveBeenCalled();
+      expect(result.isError).toBe(true);
+    });
+
+    it('exposes confirm in the schema only for destructive tools', async () => {
+      // GET tool — no confirm
+      mockEndpoints.push(makeEndpoint());
+      mockEndpointsJson = [makeConfig()];
+
+      // DELETE tool — confirm required
+      mockEndpoints.push(
+        makeEndpoint({ method: 'delete', alias: 'destructive-tool', path: '/me/items/:item-id' })
+      );
+      mockEndpointsJson.push(
+        makeConfig({
+          method: 'delete',
+          toolName: 'destructive-tool',
+          pathPattern: '/me/items/{item-id}',
+        })
+      );
+
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, createMockGraphClient() as any);
+
+      expect(server.tools.get('test-tool')!.schema).not.toHaveProperty('confirm');
+      expect(server.tools.get('destructive-tool')!.schema).toHaveProperty('confirm');
+    });
+  });
+
+  // ---- 13. Server-side $select projection (#660) ----
+  describe('$select projection', () => {
+    // The onlineMeeting shape from #660: the caller asked for three fields and Graph
+    // sent the whole resource back, invite HTML and passcode included.
+    const untrimmed = {
+      value: [
+        {
+          id: 'MSo',
+          subject: 'Standup',
+          joinWebUrl: 'https://teams/x',
+          joinInformation: { content: '<div>invite</div>' },
+          joinMeetingIdSettings: { passcode: '123456' },
+        },
+      ],
+    };
+
+    async function run(
+      args: Record<string, unknown>,
+      responses?: any[],
+      outputFormat: 'json' | 'toon' = 'json'
+    ) {
+      mockEndpoints.push(makeEndpoint());
+      mockEndpointsJson = [makeConfig()];
+      const graphClient = createMockGraphClient(
+        responses ?? [{ content: [{ type: 'text', text: JSON.stringify(untrimmed) }] }],
+        outputFormat
+      );
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+      const result = await server.tools.get('test-tool')!.handler(args);
+      return { result, graphClient };
+    }
+
+    it('narrows the body to the requested fields when Graph ignored $select', async () => {
+      const { result } = await run({ select: 'id,subject,joinWebUrl' });
+      expect(JSON.parse(result.content[0].text).value[0]).toEqual({
+        id: 'MSo',
+        subject: 'Standup',
+        joinWebUrl: 'https://teams/x',
+      });
+    });
+
+    it('restricts list-users selects and responses to the configured user fields', async () => {
+      mockEndpoints.push(makeEndpoint({ alias: 'list-users', path: '/users' }));
+      mockEndpointsJson = [
+        makeConfig({ toolName: 'list-users', pathPattern: '/users', scopes: ['User.Read.All'] }),
+      ];
+      const graphClient = createMockGraphClient([
+        {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                value: [
+                  { id: '1', displayName: 'Carlos', mail: 'carlos@example.com', jobTitle: 'CEO' },
+                ],
+              }),
+            },
+          ],
+        },
+      ]);
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any, {
+        userFields: 'id,displayName,mail',
+      });
+
+      const result = await server.tools.get('list-users')!.handler({
+        select: 'id,displayName,mail,jobTitle',
+      });
+
+      expect(graphClient.graphRequest.mock.calls[0][0]).toContain('$select=id,displayName,mail');
+      expect(graphClient.graphRequest.mock.calls[0][0]).not.toContain('jobTitle');
+      expect(JSON.parse(result.content[0].text).value[0]).toEqual({
+        id: '1',
+        displayName: 'Carlos',
+        mail: 'carlos@example.com',
+      });
+    });
+
+    it('adds the configured fields when list-users is called without select', async () => {
+      mockEndpoints.push(makeEndpoint({ alias: 'list-users', path: '/users' }));
+      mockEndpointsJson = [
+        makeConfig({ toolName: 'list-users', pathPattern: '/users', scopes: ['User.Read.All'] }),
+      ];
+      const graphClient = createMockGraphClient([
+        {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                value: [{ id: '1', displayName: 'Carlos', jobTitle: 'CEO' }],
+              }),
+            },
+          ],
+        },
+      ]);
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any, { userFields: 'id,displayName' });
+
+      const result = await server.tools.get('list-users')!.handler({});
+
+      expect(graphClient.graphRequest.mock.calls[0][0]).toContain('$select=id,displayName');
+      expect(JSON.parse(result.content[0].text).value[0]).toEqual({
+        id: '1',
+        displayName: 'Carlos',
+      });
+    });
+
+    it('blocks expanded user data outside the list-users field boundary', async () => {
+      mockEndpoints.push(makeEndpoint({ alias: 'list-users', path: '/users' }));
+      mockEndpointsJson = [
+        makeConfig({ toolName: 'list-users', pathPattern: '/users', scopes: ['User.Read.All'] }),
+      ];
+      const graphClient = createMockGraphClient([
+        {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                value: [
+                  {
+                    id: '1',
+                    displayName: 'Carlos',
+                    manager: { displayName: 'Manager', jobTitle: 'CEO' },
+                  },
+                ],
+              }),
+            },
+          ],
+        },
+      ]);
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any, { userFields: 'id,displayName' });
+
+      const result = await server.tools.get('list-users')!.handler({
+        select: 'id,displayName',
+        expand: 'manager($select=displayName,jobTitle)',
+      });
+
+      expect(graphClient.graphRequest.mock.calls[0][0]).not.toContain('$expand');
+      expect(JSON.parse(result.content[0].text).value[0]).toEqual({
+        id: '1',
+        displayName: 'Carlos',
+      });
+    });
+
+    async function runListUsers(
+      userFields: string,
+      args: Record<string, unknown>,
+      graphBody: unknown
+    ) {
+      mockEndpoints.push(makeEndpoint({ alias: 'list-users', path: '/users' }));
+      mockEndpointsJson = [
+        makeConfig({ toolName: 'list-users', pathPattern: '/users', scopes: ['User.Read.All'] }),
+      ];
+      const graphClient = createMockGraphClient([
+        { content: [{ type: 'text', text: JSON.stringify(graphBody) }] },
+      ]);
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any, { userFields });
+      const result = await server.tools.get('list-users')!.handler(args);
+      return { result, graphClient };
+    }
+
+    // The intersection is empty, so the fallback asks Graph for the whole allowlist. The
+    // projection has to use that same list, or it degrades to a no-op that ships whatever
+    // else Graph decided to include.
+    it('still projects when the requested fields are all disallowed', async () => {
+      const { result, graphClient } = await runListUsers(
+        'id,displayName',
+        { select: 'jobTitle,employeeId' },
+        { value: [{ id: '1', displayName: 'Carlos', jobTitle: 'CEO' }] }
+      );
+
+      expect(graphClient.graphRequest.mock.calls[0][0]).toContain('$select=id,displayName');
+      expect(JSON.parse(result.content[0].text).value[0]).toEqual({
+        id: '1',
+        displayName: 'Carlos',
+      });
+    });
+
+    // id is kept implicitly on the ordinary $select path, but here the allowlist is the
+    // whole promise: a field the operator did not list must not come back.
+    it('drops id when the allowlist does not name it', async () => {
+      const { result } = await runListUsers(
+        'displayName',
+        {},
+        { value: [{ id: '1', displayName: 'Carlos', jobTitle: 'CEO' }] }
+      );
+
+      expect(JSON.parse(result.content[0].text).value[0]).toEqual({ displayName: 'Carlos' });
+    });
+
+    it('keeps the pagination envelope while enforcing the boundary', async () => {
+      const { result } = await runListUsers(
+        'displayName',
+        {},
+        {
+          '@odata.nextLink': 'https://graph/next',
+          value: [{ id: '1', displayName: 'Carlos', jobTitle: 'CEO' }],
+        }
+      );
+
+      expect(JSON.parse(result.content[0].text)).toEqual({
+        '@odata.nextLink': 'https://graph/next',
+        value: [{ displayName: 'Carlos' }],
+      });
+    });
+
+    // The ordinary path returns the body untrimmed when none of the selected fields show
+    // up, to protect against a typo. Under the boundary that would hand back everything.
+    it('fails closed when Graph returns none of the allowlisted fields', async () => {
+      const { result } = await runListUsers(
+        'displayName',
+        {},
+        { value: [{ id: '1', jobTitle: 'CEO', employeeId: 'E-1' }] }
+      );
+
+      expect(JSON.parse(result.content[0].text).value[0]).toEqual({});
+    });
+
+    it('refuses to register with an allowlist that names no fields', async () => {
+      mockEndpoints.push(makeEndpoint({ alias: 'list-users', path: '/users' }));
+      mockEndpointsJson = [
+        makeConfig({ toolName: 'list-users', pathPattern: '/users', scopes: ['User.Read.All'] }),
+      ];
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+
+      expect(() =>
+        registerGraphTools(server as any, createMockGraphClient() as any, { userFields: ' , ,' })
+      ).toThrow(/names no fields/);
+    });
+
+    // execute-tool reaches the same Graph path by a different route, so the boundary has
+    // to be asserted there too rather than inferred from the registerGraphTools tests.
+    it('enforces the boundary through discovery mode execute-tool', async () => {
+      mockEndpoints.push(makeEndpoint({ alias: 'list-users', path: '/users' }));
+      mockEndpointsJson = [
+        makeConfig({ toolName: 'list-users', pathPattern: '/users', scopes: ['User.Read.All'] }),
+      ];
+      const graphClient = createMockGraphClient([
+        {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                value: [{ id: '1', displayName: 'Carlos', jobTitle: 'CEO' }],
+              }),
+            },
+          ],
+        },
+      ]);
+      const server = createMockServer();
+      const { registerDiscoveryTools } = await loadModule();
+      registerDiscoveryTools(server as any, graphClient as any, {
+        userFields: 'id,displayName',
+      });
+
+      const result = await server.tools.get('execute-tool')!.handler({
+        tool_name: 'list-users',
+        parameters: { select: 'id,displayName,jobTitle' },
+      });
+
+      expect(graphClient.graphRequest.mock.calls[0][0]).toContain('$select=id,displayName');
+      expect(graphClient.graphRequest.mock.calls[0][0]).not.toContain('jobTitle');
+      expect(JSON.parse(result.content[0].text).value[0]).toEqual({
+        id: '1',
+        displayName: 'Carlos',
+      });
+    });
+
+    // manager and directReports return other people's displayName, mail and jobTitle, so
+    // omitting $select on either used to hand back everything the allowlist excluded.
+    it('projects a directory navigation that returns user profile data', async () => {
+      mockEndpoints.push(
+        makeEndpoint({ alias: 'get-user-manager', path: '/users/:userId/manager' })
+      );
+      mockEndpointsJson = [
+        makeConfig({
+          toolName: 'get-user-manager',
+          pathPattern: '/users/{user-id}/manager',
+          scopes: ['User.Read.All'],
+        }),
+      ];
+      const graphClient = createMockGraphClient([
+        {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                id: 'm1',
+                displayName: 'Manager',
+                mail: 'manager@example.com',
+                jobTitle: 'CEO',
+                employeeId: 'E-9',
+              }),
+            },
+          ],
+        },
+      ]);
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any, {
+        userFields: 'id,displayName,mail',
+      });
+
+      const result = await server.tools.get('get-user-manager')!.handler({ userId: 'abc' });
+
+      // directoryObject needs an OData cast before Graph will $select a user-only
+      // property, so the request is left alone and the response carries the boundary.
+      expect(graphClient.graphRequest.mock.calls[0][0]).not.toContain('$select');
+      expect(JSON.parse(result.content[0].text)).toEqual({
+        id: 'm1',
+        displayName: 'Manager',
+        mail: 'manager@example.com',
+      });
+    });
+
+    it('projects group members, which carry the same profile fields', async () => {
+      mockEndpoints.push(
+        makeEndpoint({ alias: 'list-group-members', path: '/groups/:groupId/members' })
+      );
+      mockEndpointsJson = [
+        makeConfig({
+          toolName: 'list-group-members',
+          pathPattern: '/groups/{group-id}/members',
+          scopes: ['GroupMember.Read.All'],
+        }),
+      ];
+      const graphClient = createMockGraphClient([
+        {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                value: [{ id: '1', displayName: 'Carlos', jobTitle: 'CEO' }],
+              }),
+            },
+          ],
+        },
+      ]);
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any, { userFields: 'id,displayName' });
+
+      const result = await server.tools.get('list-group-members')!.handler({ groupId: 'g1' });
+
+      expect(JSON.parse(result.content[0].text).value[0]).toEqual({
+        id: '1',
+        displayName: 'Carlos',
+      });
+    });
+
+    it.each([
+      { alias: 'get-current-user', path: '/me', pathPattern: '/me', args: {} },
+      {
+        alias: 'get-group',
+        path: '/groups/:groupId',
+        pathPattern: '/groups/{group-id}',
+        args: { groupId: 'g1' },
+      },
+    ])('strips $expand from $alias while the field policy is active', async (endpoint) => {
+      mockEndpoints.push(makeEndpoint({ alias: endpoint.alias, path: endpoint.path }));
+      mockEndpointsJson = [
+        makeConfig({
+          toolName: endpoint.alias,
+          pathPattern: endpoint.pathPattern,
+          scopes: ['User.Read.All'],
+        }),
+      ];
+      const graphClient = createMockGraphClient([
+        { content: [{ type: 'text', text: JSON.stringify({ id: '1' }) }] },
+      ]);
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any, { userFields: 'id,displayName' });
+
+      await server.tools.get(endpoint.alias)!.handler({
+        ...endpoint.args,
+        expand: 'manager($select=displayName,jobTitle)',
+      });
+
+      expect(graphClient.graphRequest.mock.calls[0][0]).not.toContain('$expand');
+    });
+
+    // graph-batch forwards subrequest URLs verbatim, so /users?$select=employeeId reached
+    // Graph without ever touching list-users.
+    it('restricts a graph-batch subrequest that reads the users surface', async () => {
+      mockEndpoints.push(
+        makeEndpoint({
+          alias: 'graph-batch',
+          method: 'post',
+          path: '/$batch',
+          parameters: [{ name: 'body', type: 'Body', schema: z.any() }],
+        })
+      );
+      mockEndpointsJson = [
+        makeConfig({ toolName: 'graph-batch', pathPattern: '/$batch', method: 'post' }),
+      ];
+      const graphClient = createMockGraphClient([
+        {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                responses: [
+                  {
+                    id: '1',
+                    status: 200,
+                    body: {
+                      value: [{ id: '1', displayName: 'Carlos', employeeId: 'E-1' }],
+                    },
+                  },
+                  { id: '2', status: 200, body: { id: 'm1', subject: 'Keep me' } },
+                  { id: '3', status: 200, body: { id: 'g1', displayName: 'Team' } },
+                ],
+              }),
+            },
+          ],
+        },
+      ]);
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any, { userFields: 'id,displayName' });
+
+      const result = await server.tools.get('graph-batch')!.handler({
+        body: {
+          requests: [
+            { id: '1', method: 'GET', url: '/users?$select=id,displayName,employeeId' },
+            { id: '2', method: 'GET', url: '/me/messages/m1?$select=id,subject' },
+            { id: '3', method: 'GET', url: '/groups/g1?$expand=members($select=mail)' },
+          ],
+        },
+      });
+
+      const sentBody = JSON.parse(graphClient.graphRequest.mock.calls[0][1].body);
+      expect(sentBody.requests[0].url).toBe('/users?$select=id,displayName');
+      // A subrequest that is not a profile read has to pass through untouched.
+      expect(sentBody.requests[1].url).toBe('/me/messages/m1?$select=id,subject');
+      expect(sentBody.requests[2].url).toBe('/groups/g1');
+
+      const responses = JSON.parse(result.content[0].text).responses;
+      expect(responses[0].body.value[0]).toEqual({ id: '1', displayName: 'Carlos' });
+      expect(responses[1].body).toEqual({ id: 'm1', subject: 'Keep me' });
+    });
+
+    // download-bytes returns the response verbatim, so there is no projection step to
+    // enforce the allowlist in; it has to refuse instead.
+    it('refuses a byte-passthrough read of the users surface', async () => {
+      mockEndpoints.length = 0;
+      mockEndpointsJson = [];
+      const graphClient = createMockGraphClient();
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any, { userFields: 'id,displayName' });
+
+      const result = await server.tools.get('download-bytes')!.handler({
+        target: '/users?$select=employeeId',
+      });
+
+      expect(result.isError).toBe(true);
+      expect(JSON.parse(result.content[0].text).error).toBe('user_fields_restricted');
+      expect(graphClient.graphRequest).not.toHaveBeenCalled();
+    });
+
+    it('still allows byte reads below a user, such as a profile photo', async () => {
+      mockEndpoints.length = 0;
+      mockEndpointsJson = [];
+      const graphClient = createMockGraphClient([
+        { content: [{ type: 'text', text: JSON.stringify({ message: 'OK!' }) }] },
+      ]);
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any, { userFields: 'id,displayName' });
+
+      await server.tools.get('download-bytes')!.handler({
+        target: '/users/abc/photo/$value',
+      });
+
+      expect(graphClient.graphRequest).toHaveBeenCalledTimes(1);
+    });
+
+    it('leaves the body untouched when no select was passed', async () => {
+      const { result } = await run({});
+      expect(JSON.parse(result.content[0].text)).toEqual(untrimmed);
+    });
+
+    it('forces JSON so a --toon client still gets a trimmed body', async () => {
+      const { result, graphClient } = await run({ select: 'id,subject' }, undefined, 'toon');
+      expect(graphClient.graphRequest).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({ forceJsonOutput: true })
+      );
+      expect(result.content[0].text.startsWith('TOON:')).toBe(true);
+      expect(result.content[0].text).not.toContain('joinInformation');
+    });
+
+    // Regression: the merge re-encodes to TOON, so projecting after it would JSON.parse
+    // a TOON string, throw, and silently ship the untrimmed body.
+    it('still projects when --toon and fetchAllPages are combined', async () => {
+      const { result } = await run(
+        { select: 'id,subject', fetchAllPages: true },
+        [
+          {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({
+                  value: [{ id: '1', subject: 'a', joinInformation: { content: 'huge' } }],
+                  '@odata.nextLink': 'https://graph.microsoft.com/v1.0/me/messages?$skip=1',
+                }),
+              },
+            ],
+          },
+          {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({
+                  value: [{ id: '2', subject: 'b', joinInformation: { content: 'huge' } }],
+                }),
+              },
+            ],
+          },
+        ],
+        'toon'
+      );
+      expect(result.content[0].text.startsWith('TOON:')).toBe(true);
+      expect(result.content[0].text).not.toContain('joinInformation');
+      const merged = JSON.parse(result.content[0].text.slice('TOON:'.length));
+      expect(merged.value).toEqual([
+        { id: '1', subject: 'a' },
+        { id: '2', subject: 'b' },
+      ]);
+    });
+
+    // Binary and raw-text payloads are wrapped in an envelope; projecting one would
+    // strip every key and lose the file or transcript.
+    it('does not project a raw-text transport envelope', async () => {
+      const envelope = { message: 'OK!', rawResponse: 'WEBVTT\n\n00:00:01.000 --> 00:00:02.000' };
+      const { result } = await run({ select: 'id' }, [
+        { content: [{ type: 'text', text: JSON.stringify(envelope) }] },
+      ]);
+      expect(JSON.parse(result.content[0].text)).toEqual(envelope);
+    });
+
+    it('does not project a binary transport envelope', async () => {
+      const envelope = {
+        message: 'OK!',
+        contentType: 'video/mp4',
+        encoding: 'base64',
+        contentLength: 3,
+        contentBytes: 'AAA',
+      };
+      const { result } = await run({ select: 'id' }, [
+        { content: [{ type: 'text', text: JSON.stringify(envelope) }] },
+      ]);
+      expect(JSON.parse(result.content[0].text)).toEqual(envelope);
+    });
+
+    // $select and $expand are independent in OData: the expanded property arrives in
+    // addition to the selected fields and has to survive the projection.
+    it('keeps an $expand-ed navigation property that was not selected', async () => {
+      const { result } = await run({ select: 'subject', expand: 'attachments' }, [
+        {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                id: '1',
+                subject: 'a',
+                attachments: [{ id: 'att1' }],
+                bodyPreview: 'huge',
+              }),
+            },
+          ],
+        },
+      ]);
+      const body = JSON.parse(result.content[0].text);
+      expect(body.attachments).toEqual([{ id: 'att1' }]);
+      expect(body).not.toHaveProperty('bodyPreview');
+    });
+
+    // Graph never rejects a bad property name on the endpoints that ignore $select, so
+    // a typo would otherwise silently reduce the response to {id}.
+    it('returns the body untrimmed when no requested field is present', async () => {
+      const body = { id: '1', joinWebUrl: 'u', joinInformation: { content: 'huge' } };
+      const { result } = await run({ select: 'joinUrl' }, [
+        { content: [{ type: 'text', text: JSON.stringify(body) }] },
+      ]);
+      expect(JSON.parse(result.content[0].text)).toEqual(body);
+    });
+
+    it('keeps the _etag that includeHeaders adds to a single resource', async () => {
+      const { result } = await run({ select: 'subject', includeHeaders: true }, [
+        {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({ id: '1', subject: 'a', _etag: 'W/"1"', bodyPreview: 'huge' }),
+            },
+          ],
+        },
+      ]);
+      expect(JSON.parse(result.content[0].text)).toEqual({
+        id: '1',
+        subject: 'a',
+        _etag: 'W/"1"',
+      });
+    });
+
+    // Asserting on the body alone passed even with the excludeResponse clause removed,
+    // because { success: true } trips the envelope guard anyway. forceJsonOutput is the
+    // signal that projection was never armed in the first place.
+    it('does not arm projection when excludeResponse was requested', async () => {
+      const { result, graphClient } = await run({ select: 'id', excludeResponse: true }, [
+        { content: [{ type: 'text', text: JSON.stringify({ success: true }) }] },
+      ]);
+      expect(graphClient.graphRequest).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.not.objectContaining({ forceJsonOutput: true })
+      );
+      expect(JSON.parse(result.content[0].text)).toEqual({ success: true });
+    });
+
+    // An error body still reaches the merge block, which parses and re-serializes it, so
+    // shouldProject is the only thing standing between it and the projection. Two keys
+    // with one selected: if the guard goes, `code` disappears.
+    it('does not project an error body on the merge path', async () => {
+      const errorBody = { error: 'Microsoft Graph API error: 403 Forbidden', code: 'accessDenied' };
+      const { result } = await run({ select: 'error', fetchAllPages: true }, [
+        { content: [{ type: 'text', text: JSON.stringify(errorBody) }], isError: true },
+      ]);
+      expect(JSON.parse(result.content[0].text)).toEqual(errorBody);
+    });
+
+    // A page failing mid-merge replaces `response` with the error, which the guard
+    // computed before the request cannot see.
+    it('leaves an error from a later page alone', async () => {
+      const errorBody = { error: 'Microsoft Graph API error: 503 Service Unavailable' };
+      const { result } = await run(
+        { select: 'error', fetchAllPages: true },
+        [
+          {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({
+                  value: [{ id: '1', subject: 'a' }],
+                  '@odata.nextLink': 'https://graph.microsoft.com/v1.0/me/messages?$skip=1',
+                }),
+              },
+            ],
+          },
+          { content: [{ type: 'text', text: JSON.stringify(errorBody) }], isError: true },
+        ],
+        'toon'
+      );
+      expect(result.content[0].text.startsWith('TOON:')).toBe(false);
+      expect(JSON.parse(result.content[0].text)).toEqual(errorBody);
+    });
+
+    // The llmTips tell the model to pass select=id,subject,joinWebUrl, so id is in the
+    // list nearly every time; counting it as a match made the typo guard inert.
+    it('returns the body untrimmed when the only real field is a typo alongside id', async () => {
+      const { result } = await run({ select: 'id,joinUrl' });
+      expect(JSON.parse(result.content[0].text)).toEqual(untrimmed);
+    });
+  });
+
+  // ---- isDestructiveOperation helper ----
+  describe('isDestructiveOperation', () => {
+    it('returns true for POST, PATCH, PUT, DELETE', async () => {
+      const { isDestructiveOperation } = await loadModule();
+      expect(isDestructiveOperation('POST', undefined)).toBe(true);
+      expect(isDestructiveOperation('PATCH', undefined)).toBe(true);
+      expect(isDestructiveOperation('PUT', undefined)).toBe(true);
+      expect(isDestructiveOperation('DELETE', undefined)).toBe(true);
+    });
+
+    it('is case-insensitive', async () => {
+      const { isDestructiveOperation } = await loadModule();
+      expect(isDestructiveOperation('delete', undefined)).toBe(true);
+      expect(isDestructiveOperation('Patch', undefined)).toBe(true);
+    });
+
+    it('returns false for GET / HEAD / OPTIONS', async () => {
+      const { isDestructiveOperation } = await loadModule();
+      expect(isDestructiveOperation('GET', undefined)).toBe(false);
+      expect(isDestructiveOperation('HEAD', undefined)).toBe(false);
+      expect(isDestructiveOperation('OPTIONS', undefined)).toBe(false);
+    });
+
+    it('returns false for POST endpoints flagged readOnly', async () => {
+      const { isDestructiveOperation } = await loadModule();
+      expect(isDestructiveOperation('POST', { readOnly: true } as any)).toBe(false);
+    });
+
+    it('still returns true for PATCH/DELETE even if config.readOnly is set (should not happen but defensive)', async () => {
+      const { isDestructiveOperation } = await loadModule();
+      expect(isDestructiveOperation('PATCH', { readOnly: true } as any)).toBe(true);
+      expect(isDestructiveOperation('DELETE', { readOnly: true } as any)).toBe(true);
+    });
+  });
+
+  // ---- 9b. extract-document-text utility tool ----
+  describe('extract-document-text', () => {
+    const docxFixture = fileURLToPath(new URL('../../test/fixtures/minimal.docx', import.meta.url));
+    const pdfFixture = fileURLToPath(new URL('../../test/fixtures/minimal.pdf', import.meta.url));
+    const DOCX_MIME = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+
+    function streamOf(bytes: Buffer): ReadableStream<Uint8Array> {
+      return new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new Uint8Array(bytes));
+          controller.close();
+        },
+      });
+    }
+
+    function docxGraphClient() {
+      // Fresh bytes per call: one test pages through the same document three
+      // times, and a ReadableStream can only be consumed once.
+      return {
+        makeRequest: vi.fn().mockImplementation(async () => {
+          const bytes = readFileSync(docxFixture);
+          return {
+            name: 'minimal.docx',
+            webUrl: 'https://contoso.sharepoint.com/sites/team/Documents/minimal.docx',
+            size: bytes.length,
+            file: { mimeType: DOCX_MIME },
+          };
+        }),
+        downloadStream: vi.fn().mockImplementation(async () => {
+          const bytes = readFileSync(docxFixture);
+          return {
+            body: streamOf(bytes),
+            contentType: DOCX_MIME,
+            contentLength: bytes.length,
+            contentDisposition: null,
+          };
+        }),
+      };
+    }
+
+    async function register(graphClient: unknown, ctx?: Record<string, unknown>) {
+      mockEndpoints.length = 0;
+      mockEndpointsJson = [];
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any, ctx as any);
+      return server;
+    }
+
+    it('extracts docx text and returns the citation webUrl', async () => {
+      const graphClient = docxGraphClient();
+      const server = await register(graphClient);
+      const tool = server.tools.get('extract-document-text');
+      expect(tool).toBeDefined();
+
+      const result = await tool!.handler({ target: '/drives/drive-1/items/item-1/content' });
+
+      expect(result.isError).toBeUndefined();
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.kind).toBe('docx');
+      expect(payload.name).toBe('minimal.docx');
+      expect(payload.webUrl).toBe(
+        'https://contoso.sharepoint.com/sites/team/Documents/minimal.docx'
+      );
+      expect(payload.text).toContain('Hello from the minimal docx fixture.');
+      expect(payload.text).toContain('Second paragraph: extraction must reach this line.');
+      expect(payload.text).toContain('Alpha');
+      expect(payload.charCount).toBe(payload.text.length);
+      expect(payload.truncated).toBe(false);
+      expect(result._meta).toMatchObject({ response_bytes: expect.any(Number) });
+
+      // Metadata reads the item; bytes read /content.
+      expect(graphClient.makeRequest).toHaveBeenCalledWith('/drives/drive-1/items/item-1', {
+        accessToken: undefined,
+      });
+      expect(graphClient.downloadStream).toHaveBeenCalledWith(
+        '/drives/drive-1/items/item-1/content',
+        { accessToken: undefined }
+      );
+    });
+
+    it('extracts a pdf text layer and adds the /content suffix itself', async () => {
+      const bytes = readFileSync(pdfFixture);
+      const graphClient = {
+        makeRequest: vi.fn().mockResolvedValue({
+          name: 'minimal.pdf',
+          file: { mimeType: 'application/pdf' },
+        }),
+        downloadStream: vi.fn().mockResolvedValue({
+          body: streamOf(bytes),
+          contentType: 'application/pdf',
+          contentLength: null,
+          contentDisposition: null,
+        }),
+      };
+      const server = await register(graphClient);
+
+      const result = await server.tools
+        .get('extract-document-text')!
+        .handler({ target: '/drives/drive-1/items/item-2' });
+
+      expect(result.isError).toBeUndefined();
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.kind).toBe('pdf');
+      expect(payload.text).toContain('Hello from the minimal PDF fixture.');
+      expect(payload.text).toContain('Second PDF line with token 12345.');
+      expect(graphClient.downloadStream).toHaveBeenCalledWith(
+        '/drives/drive-1/items/item-2/content',
+        { accessToken: undefined }
+      );
+    });
+
+    it('keeps the byte size when pdfjs detaches the source buffer during extraction', async () => {
+      // pdfjs transfers standalone source buffers (documents above the 8 KiB
+      // Node Buffer pool) to its worker, which detaches the buffer the tool
+      // still holds. The payload byte size must be captured before extraction.
+      const fixture = readFileSync(pdfFixture);
+      const bytes = Buffer.concat([fixture, Buffer.alloc(128 * 1024, 0x41)]);
+      const graphClient = {
+        makeRequest: vi.fn().mockResolvedValue({
+          name: 'big.pdf',
+          file: { mimeType: 'application/pdf' },
+        }),
+        downloadStream: vi.fn().mockResolvedValue({
+          body: streamOf(bytes),
+          contentType: 'application/pdf',
+          contentLength: bytes.length,
+          contentDisposition: null,
+        }),
+      };
+      const server = await register(graphClient);
+
+      const result = await server.tools
+        .get('extract-document-text')!
+        .handler({ target: '/drives/drive-1/items/item-pdf-large' });
+
+      expect(result.isError).toBeUndefined();
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.kind).toBe('pdf');
+      expect(payload.text).toContain('Hello from the minimal PDF fixture.');
+      expect(payload.size).toBe(bytes.length);
+    });
+
+    it('pages long documents with offset/maxChars and nextOffset', async () => {
+      const graphClient = docxGraphClient();
+      const server = await register(graphClient);
+      const tool = server.tools.get('extract-document-text')!;
+
+      const fullResult = await tool.handler({ target: '/drives/drive-1/items/item-1' });
+      const fullText = JSON.parse(fullResult.content[0].text).text as string;
+      expect(fullText.length).toBeGreaterThan(20);
+
+      const first = await tool.handler({ target: '/drives/drive-1/items/item-1', maxChars: 10 });
+      const p1 = JSON.parse(first.content[0].text);
+      expect(p1.text).toBe(fullText.slice(0, 10));
+      expect(p1.returnedChars).toBe(10);
+      expect(p1.truncated).toBe(true);
+      expect(p1.nextOffset).toBe(10);
+      expect(p1.charCount).toBe(fullText.length);
+
+      const second = await tool.handler({
+        target: '/drives/drive-1/items/item-1',
+        offset: p1.nextOffset,
+        maxChars: 10,
+      });
+      const p2 = JSON.parse(second.content[0].text);
+      expect(p2.text).toBe(fullText.slice(10, 20));
+      expect(p2.offset).toBe(10);
+    });
+
+    it('falls back to the content-disposition name when there is no driveItem metadata', async () => {
+      const bytes = readFileSync(pdfFixture);
+      const graphClient = {
+        makeRequest: vi.fn().mockRejectedValue(new Error('Microsoft Graph API error: 400')),
+        downloadStream: vi.fn().mockResolvedValue({
+          body: streamOf(bytes),
+          contentType: 'application/pdf',
+          contentLength: bytes.length,
+          contentDisposition: 'attachment; filename="scan.pdf"',
+        }),
+      };
+      const server = await register(graphClient);
+
+      const result = await server.tools
+        .get('extract-document-text')!
+        .handler({ target: '/drives/drive-1/items/item-3/content' });
+
+      expect(result.isError).toBeUndefined();
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.name).toBe('scan.pdf');
+      expect(payload.webUrl).toBeUndefined();
+      expect(payload.kind).toBe('pdf');
+    });
+
+    it('notes the missing text layer instead of failing for image-only documents', async () => {
+      const graphClient = {
+        makeRequest: vi.fn().mockResolvedValue({
+          name: 'scan.txt',
+          file: { mimeType: 'text/plain' },
+        }),
+        downloadStream: vi.fn().mockResolvedValue({
+          body: streamOf(Buffer.from(' \n \n')),
+          contentType: 'text/plain',
+          contentLength: 4,
+          contentDisposition: null,
+        }),
+      };
+      const server = await register(graphClient);
+
+      const result = await server.tools
+        .get('extract-document-text')!
+        .handler({ target: '/drives/drive-1/items/item-4/content' });
+
+      expect(result.isError).toBeUndefined();
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.text.trim()).toBe('');
+      expect(payload.note).toMatch(/No extractable text/);
+    });
+
+    it('rejects unsupported document types with guidance', async () => {
+      const legacyMime = 'application/vnd.ms-powerpoint';
+      const graphClient = {
+        makeRequest: vi.fn().mockResolvedValue({
+          name: 'deck.ppt',
+          file: { mimeType: legacyMime },
+        }),
+        downloadStream: vi.fn().mockResolvedValue({
+          body: streamOf(Buffer.from('x')),
+          contentType: legacyMime,
+          contentLength: 1,
+          contentDisposition: null,
+        }),
+      };
+      const server = await register(graphClient);
+
+      const result = await server.tools
+        .get('extract-document-text')!
+        .handler({ target: '/drives/drive-1/items/item-5/content' });
+
+      expect(result.isError).toBe(true);
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.error).toMatch(/Unsupported document type/);
+      expect(payload.error).toMatch(/deck\.ppt/);
+    });
+
+    it('refuses documents over the byte cap and cancels the undrained body', async () => {
+      const cancel = vi.fn().mockResolvedValue(undefined);
+      const graphClient = {
+        makeRequest: vi.fn().mockResolvedValue({
+          name: 'huge.pdf',
+          file: { mimeType: 'application/pdf' },
+        }),
+        downloadStream: vi.fn().mockResolvedValue({
+          body: { cancel } as any,
+          contentType: 'application/pdf',
+          contentLength: 40 * 1024 * 1024,
+          contentDisposition: null,
+        }),
+      };
+      const server = await register(graphClient);
+
+      const result = await server.tools
+        .get('extract-document-text')!
+        .handler({ target: '/drives/drive-1/items/item-6/content' });
+
+      expect(result.isError).toBe(true);
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.error).toMatch(/reads at most/);
+      expect(cancel).toHaveBeenCalledTimes(1);
+    });
+
+    it('surfaces Graph download errors', async () => {
+      const graphClient = {
+        makeRequest: vi.fn().mockResolvedValue(undefined),
+        downloadStream: vi
+          .fn()
+          .mockRejectedValue(new Error('Microsoft Graph API error: 404 Not Found')),
+      };
+      const server = await register(graphClient);
+
+      const result = await server.tools
+        .get('extract-document-text')!
+        .handler({ target: '/drives/drive-1/items/missing/content' });
+
+      expect(result.isError).toBe(true);
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.error).toMatch(/404 Not Found/);
+    });
+
+    it('rejects query parameters in target', async () => {
+      const server = await register({});
+      const result = await server.tools
+        .get('extract-document-text')!
+        .handler({ target: '/drives/drive-1/items/item-1/content?$select=name' });
+
+      expect(result.isError).toBe(true);
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.error).toMatch(/query parameters/);
+    });
+
+    it('forwards the resolved account token in multi-account mode', async () => {
+      const graphClient = docxGraphClient();
+      const authManager = {
+        isOAuthModeEnabled: vi.fn().mockReturnValue(false),
+        getToken: vi.fn().mockResolvedValue(null),
+        getTokenForAccount: vi.fn().mockResolvedValue('account-2-token'),
+      };
+      const server = await register(graphClient, {
+        authManager,
+        multiAccount: true,
+        accountNames: ['user1@domain.com', 'user2@domain.com'],
+      });
+
+      const result = await server.tools.get('extract-document-text')!.handler({
+        target: '/drives/drive-1/items/item-1/content',
+        account: 'user2@domain.com',
+      });
+
+      expect(result.isError).toBeUndefined();
+      expect(authManager.getTokenForAccount).toHaveBeenCalledWith('user2@domain.com');
+      expect(graphClient.downloadStream).toHaveBeenCalledWith(
+        '/drives/drive-1/items/item-1/content',
+        { accessToken: 'account-2-token' }
+      );
+      expect(graphClient.makeRequest).toHaveBeenCalledWith('/drives/drive-1/items/item-1', {
+        accessToken: 'account-2-token',
+      });
+    });
+
+    it('is available in both stdio and HTTP mode', async () => {
+      const { registerGraphTools } = await loadModule();
+
+      mockEndpoints.length = 0;
+      mockEndpointsJson = [];
+      const stdioServer = createMockServer();
+      registerGraphTools(stdioServer as any, {} as any);
+      expect(stdioServer.tools.has('extract-document-text')).toBe(true);
+
+      const httpServer = createMockServer();
+      registerGraphTools(httpServer as any, {} as any, { httpMode: true });
+      expect(httpServer.tools.has('extract-document-text')).toBe(true);
+    });
+
+    async function buildXlsxBytes(): Promise<Buffer> {
+      const zip = new JSZip();
+      zip.file(
+        'xl/workbook.xml',
+        '<?xml version="1.0"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" ' +
+          'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">' +
+          '<sheets><sheet name="Budget" sheetId="1" r:id="rId1"/></sheets></workbook>'
+      );
+      zip.file(
+        'xl/_rels/workbook.xml.rels',
+        '<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+          '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>' +
+          '</Relationships>'
+      );
+      zip.file(
+        'xl/sharedStrings.xml',
+        '<?xml version="1.0"?><sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">' +
+          '<si><t>Kvartals</t><t>regnskab</t></si></sst>'
+      );
+      zip.file(
+        'xl/worksheets/sheet1.xml',
+        '<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">' +
+          '<sheetData><row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1"><v>1234.5</v></c></row></sheetData></worksheet>'
+      );
+      return zip.generateAsync({ type: 'nodebuffer' });
+    }
+
+    async function buildPptxBytes(): Promise<Buffer> {
+      const zip = new JSZip();
+      zip.file(
+        'ppt/presentation.xml',
+        '<?xml version="1.0"?><p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" ' +
+          'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">' +
+          '<p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst></p:presentation>'
+      );
+      zip.file(
+        'ppt/_rels/presentation.xml.rels',
+        '<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+          '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/>' +
+          '</Relationships>'
+      );
+      zip.file(
+        'ppt/slides/slide1.xml',
+        '<?xml version="1.0"?><p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" ' +
+          'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree>' +
+          '<p:sp><p:txBody><a:p><a:r><a:t>Strategi 2027</a:t></a:r></a:p></p:txBody></p:sp>' +
+          '</p:spTree></p:cSld></p:sld>'
+      );
+      return zip.generateAsync({ type: 'nodebuffer' });
+    }
+
+    it('extracts spreadsheet text through the tool', async () => {
+      const xlsxMime = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+      const bytes = await buildXlsxBytes();
+      const graphClient = {
+        makeRequest: vi.fn().mockResolvedValue({
+          name: 'budget.xlsx',
+          file: { mimeType: xlsxMime },
+          webUrl: 'https://contoso.sharepoint.com/sites/team/Documents/budget.xlsx',
+        }),
+        downloadStream: vi.fn().mockResolvedValue({
+          body: streamOf(bytes),
+          contentType: xlsxMime,
+          contentLength: bytes.length,
+          contentDisposition: null,
+        }),
+      };
+      const server = await register(graphClient);
+
+      const result = await server.tools
+        .get('extract-document-text')!
+        .handler({ target: '/drives/drive-1/items/item-xlsx/content' });
+
+      expect(result.isError).toBeUndefined();
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.kind).toBe('xlsx');
+      expect(payload.name).toBe('budget.xlsx');
+      expect(payload.webUrl).toContain('budget.xlsx');
+      expect(payload.text).toContain('[Sheet: Budget]');
+      expect(payload.text).toContain('Kvartalsregnskab');
+      expect(payload.text).toContain('1234.5');
+    });
+
+    it('extracts presentation text through the tool', async () => {
+      const pptxMime = 'application/vnd.openxmlformats-officedocument.presentationml.presentation';
+      const bytes = await buildPptxBytes();
+      const graphClient = {
+        makeRequest: vi.fn().mockResolvedValue({
+          name: 'deck.pptx',
+          file: { mimeType: pptxMime },
+        }),
+        downloadStream: vi.fn().mockResolvedValue({
+          body: streamOf(bytes),
+          contentType: pptxMime,
+          contentLength: bytes.length,
+          contentDisposition: null,
+        }),
+      };
+      const server = await register(graphClient);
+
+      const result = await server.tools
+        .get('extract-document-text')!
+        .handler({ target: '/drives/drive-1/items/item-pptx/content' });
+
+      expect(result.isError).toBeUndefined();
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.kind).toBe('pptx');
+      expect(payload.text).toContain('[Slide 1]');
+      expect(payload.text).toContain('Strategi 2027');
+    });
+  });
+
+  // ---- 9c. search index utility tools ----
+  describe('search index utility tools', () => {
+    async function registerIndexTools(graphClient: unknown) {
+      mockEndpoints.length = 0;
+      mockEndpointsJson = [];
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+      return server;
+    }
+
+    it('registers the three index tools', async () => {
+      const server = await registerIndexTools({});
+      expect(server.tools.has('semantic-search')).toBe(true);
+      expect(server.tools.has('refresh-search-index')).toBe(true);
+      expect(server.tools.has('search-index-status')).toBe(true);
+    });
+
+    it('explains itself when the index has not been initialized', async () => {
+      const server = await registerIndexTools({});
+
+      const search = await server.tools.get('semantic-search')!.handler({ query: 'budget' });
+      expect(search.isError).toBe(true);
+      expect(JSON.parse(search.content[0].text).error).toMatch(/search index/i);
+
+      const refresh = await server.tools.get('refresh-search-index')!.handler({});
+      expect(refresh.isError).toBe(true);
+      expect(JSON.parse(refresh.content[0].text).error).toMatch(/search index/i);
+
+      const status = await server.tools.get('search-index-status')!.handler({});
+      expect(status.isError).toBeUndefined();
+      const payload = JSON.parse(status.content[0].text);
+      expect(payload.ready).toBe(false);
+      expect(payload.enabled).toBe(false);
     });
   });
 });
