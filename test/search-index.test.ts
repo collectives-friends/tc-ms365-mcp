@@ -733,6 +733,7 @@ describe.skipIf(!sqliteAvailable)('index runtime with fake Graph and embeddings'
     expect(status.driveStates[0]?.hasDeltaToken).toBe(true);
     expect(status.driveStates[0]?.lastRun?.indexed).toBe(1);
     expect(status.driveStates[0]?.lastRun?.moreRemaining).toBe(false);
+    expect(status.byDrive[0]?.reasons?.['skipped/unsupported']).toBe(1);
     expect(status.dbBytes).toBeGreaterThan(0);
 
     const search = await semanticSearch({ query: 'Alpha', topK: 5 });
@@ -754,6 +755,21 @@ describe.skipIf(!sqliteAvailable)('index runtime with fake Graph and embeddings'
       .map((call) => String(call[0]))
       .filter((url) => url.includes('token-1'));
     expect(deltaCalls.length).toBe(1);
+  });
+
+  it('removes drive state for drives that are no longer configured', async () => {
+    const store = await openSearchIndexStore({
+      dbPath: env.MS365_MCP_INDEX_DB as string,
+      dims: TEST_DIMS,
+      embedModel: 'test-embed',
+    });
+    store.recordDriveRun('drv-stale', 'error');
+    store.close();
+
+    await initSearchIndex(deps, env);
+    const status = searchIndexStatus(env);
+    expect(status.driveStates.some((state) => state.driveId === 'drv-stale')).toBe(false);
+    expect(status.driveStates.length).toBe(0);
   });
 
   it('resumes a budget-limited cold run on the next run instead of restarting', async () => {

@@ -101,6 +101,21 @@ function parseRunRecord(value: unknown): DriveRunRecord | undefined {
   return undefined;
 }
 
+const KNOWN_SKIP_REASONS = new Set(['unsupported', 'package', 'too_large', 'empty']);
+
+/** Map a stored skip/error reason to a short, safe code for the status output. */
+function normalizeReason(reason: string | undefined): string {
+  if (!reason) return 'unknown';
+  if (KNOWN_SKIP_REASONS.has(reason)) return reason;
+  if (/too large|expand past|size limit/i.test(reason)) return 'too_large';
+  if (/not read|could not be read|corrupt|password|encrypted|unreadable|no text/i.test(reason)) {
+    return 'unreadable';
+  }
+  if (/timeout|abort/i.test(reason)) return 'timeout';
+  if (/graph|http \d|fetch|network|ENOTFOUND|ECONN/i.test(reason)) return 'graph_error';
+  return 'error';
+}
+
 /** Counts persisted for one drive after a sync run, shown by `search-index-status`. */
 export interface DriveRunRecord {
   at: string;
@@ -619,13 +634,32 @@ export class SearchIndexStore {
   counts(): {
     documents: number;
     chunks: number;
-    byDrive: Array<{ driveId: string; documents: number; errors: number; chunks: number }>;
+    byDrive: Array<{
+      driveId: string;
+      documents: number;
+      errors: number;
+      chunks: number;
+      reasons: Record<string, number>;
+    }>;
   } {
     const documents =
       toNumber(
         this.db.prepare("SELECT COUNT(*) AS count FROM items WHERE state = 'indexed'").get()?.count
       ) ?? 0;
     const chunks = this.searchableChunkCount();
+    const reasonsByDrive = new Map<string, Record<string, number>>();
+    const reasonRows = this.db
+      .prepare(
+        'SELECT drive_id, state, skip_reason, COUNT(*) AS count FROM items ' +
+          "WHERE state IN ('skipped', 'error') GROUP BY drive_id, state, skip_reason"
+      )
+      .all();
+    for (const row of reasonRows) {
+      const bucket = reasonsByDrive.get(String(row.drive_id)) ?? {};
+      const key = `${String(row.state)}/${normalizeReason(toText(row.skip_reason))}`;
+      bucket[key] = (bucket[key] ?? 0) + (toNumber(row.count) ?? 0);
+      reasonsByDrive.set(String(row.drive_id), bucket);
+    }
     const byDrive = this.db
       .prepare(
         'SELECT drive_id, ' +
@@ -640,6 +674,7 @@ export class SearchIndexStore {
         documents: toNumber(row.documents) ?? 0,
         errors: toNumber(row.errors) ?? 0,
         chunks: toNumber(row.chunks) ?? 0,
+        reasons: reasonsByDrive.get(String(row.drive_id)) ?? {},
       }));
     return { documents, chunks, byDrive };
   }

@@ -129,12 +129,15 @@ export async function initSearchIndex(
       dims: config.embedDims,
       baseUrl: config.openaiBaseUrl,
     });
-  runtime = { config, store, embed, syncing: false };
+  const active: SearchIndexRuntime = { config, store, embed, syncing: false };
+  runtime = active;
   blockReason = undefined;
   logger.info(
     `[SEARCH INDEX] ready: ${store.vectorEnabled ? 'sqlite-vec' : 'fts5-only'} backend, ` +
       `${config.driveIds.length} drive(s), sync every ${config.syncMinutes} min`
   );
+  pruneStaleDrives(store, config.driveIds);
+  warmSearchPaths(active);
 
   if (config.syncMinutes > 0) {
     initialTimer = setTimeout(() => {
@@ -267,6 +270,43 @@ function emptySummary(driveId: string): DriveSyncSummary {
 
 function deferredSummary(driveId: string): DriveSyncSummary {
   return { ...emptySummary(driveId), status: 'deferred', moreRemaining: true };
+}
+
+/**
+ * Drop drive rows (and any items with them) for drives that are no longer in
+ * MS365_MCP_INDEX_DRIVES, so a renamed or pasted-wrong id does not linger in
+ * the status output forever.
+ */
+function pruneStaleDrives(store: SearchIndexStore, driveIds: string[]): void {
+  const configured = new Set(driveIds);
+  for (const state of store.listDriveStates()) {
+    if (configured.has(state.driveId)) continue;
+    try {
+      store.resetDrive(state.driveId);
+      logger.info('[SEARCH INDEX] removed state for an unconfigured drive');
+    } catch (error) {
+      logger.warn(`[SEARCH INDEX] could not remove unconfigured drive state: ${shortError(error)}`);
+    }
+  }
+}
+
+/**
+ * Touch the KNN and FTS paths once at startup so the first real query after a
+ * restart does not pay the lazy-initialisation cost. No network calls.
+ */
+function warmSearchPaths(active: SearchIndexRuntime): void {
+  try {
+    if (active.store.vectorEnabled) {
+      active.store.vectorSearch(new Float32Array(active.config.embedDims), 1);
+    }
+    const fts = buildFtsQuery('warmup');
+    if (fts) {
+      const rows = active.store.lexicalSearch(fts, 1);
+      if (rows.length > 0) active.store.chunksWithItems([rows[0].rowid]);
+    }
+  } catch (error) {
+    logger.warn(`[SEARCH INDEX] search warmup failed: ${shortError(error)}`);
+  }
 }
 
 /**
@@ -1077,7 +1117,13 @@ export interface SearchIndexStatus {
   syncing: boolean;
   documents: number;
   chunks: number;
-  byDrive: Array<{ driveId: string; documents: number; errors: number; chunks: number }>;
+  byDrive: Array<{
+    driveId: string;
+    documents: number;
+    errors: number;
+    chunks: number;
+    reasons?: Record<string, number>;
+  }>;
   driveStates: Array<{
     driveId: string;
     lastRunAt?: string;

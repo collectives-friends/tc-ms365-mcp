@@ -2248,7 +2248,7 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
     searchKeywords:
       'search index status index coverage documents indexed chunks last sync vector backend embedding model',
     description:
-      'Report the state of the semantic search index: whether it is enabled and ready, the vector backend (sqlite-vec or FTS5-only), the embedding model and dimensions, per-drive document/chunk/error counts, the last run time and status per drive, the last run counts per drive (lastRun: seen/folders/indexed/unchanged/skipped/deleted/errors/moreRemaining/elapsedMs) and the index file size. Use it to check coverage before or after refresh-search-index; lastRun also shows the numbers of a sync call that timed out on the client.',
+      'Report the state of the semantic search index: whether it is enabled and ready, the vector backend (sqlite-vec or FTS5-only), the embedding model and dimensions, per-drive document/chunk/error counts, per-drive item reasons (reasons: counts per state/reason code, e.g. "skipped/unsupported" or "error/unreadable"), the last run time and status per drive, the last run counts per drive (lastRun: seen/folders/indexed/unchanged/skipped/deleted/errors/moreRemaining/elapsedMs) and the index file size. Use it to check coverage before or after refresh-search-index; lastRun also shows the numbers of a sync call that timed out on the client.',
     readOnlyHint: true,
     openWorldHint: false,
     buildSchema: () => ({}),
