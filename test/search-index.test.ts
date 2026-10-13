@@ -65,13 +65,24 @@ async function buildXlsxFixture(): Promise<Buffer> {
       '<si><t>Kvartals</t><t>regnskab</t></si><si><t>Omsætning</t></si></sst>'
   );
   zip.file(
+    'xl/styles.xml',
+    '<?xml version="1.0"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">' +
+      '<numFmts count="1"><numFmt numFmtId="164" formatCode="dd-mm-yyyy"/></numFmts>' +
+      '<cellXfs count="3"><xf numFmtId="0"/><xf numFmtId="14"/><xf numFmtId="164"/></cellXfs>' +
+      '</styleSheet>'
+  );
+  zip.file(
     'xl/worksheets/sheet1.xml',
     '<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">' +
       '<sheetData>' +
       '<row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1"><v>1234.5</v></c></row>' +
       '<row r="2"><c r="A2" t="s"><v>1</v></c>' +
       '<c r="C2" t="inlineStr"><is><t>Noter her</t></is></c></row>' +
-      '<row r="3"/>' +
+      '<row r="3">' +
+      '<c r="A3" s="1"><v>25569</v></c>' +
+      '<c r="B3" s="2"><v>45874</v></c>' +
+      '<c r="C3"><v>1234.5</v></c>' +
+      '</row>' +
       '</sheetData></worksheet>'
   );
   zip.file(
@@ -125,6 +136,14 @@ async function buildPptxFixture(): Promise<Buffer> {
       'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">' +
       '<p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>Husk talegenkendelse</a:t></a:r></a:p>' +
       '</p:txBody></p:sp></p:spTree></p:cSld></p:notes>'
+  );
+  zip.file(
+    'ppt/diagrams/data1.xml',
+    '<?xml version="1.0"?><dgm:dataModel xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram" ' +
+      'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><dgm:ptLst><dgm:pt><dgm:t>' +
+      '<a:txBody><a:p><a:r><a:t>Organisation og ledelse</a:t></a:r></a:p>' +
+      '<a:p><a:r><a:t>Fase 2 udvidelse</a:t></a:r></a:p></a:txBody>' +
+      '</dgm:t></dgm:pt></dgm:ptLst></dgm:dataModel>'
   );
   return zip.generateAsync({ type: 'nodebuffer' });
 }
@@ -254,6 +273,15 @@ describe('document kinds and OOXML extraction', () => {
     expect(text).not.toContain('[Sheet: Tomt]');
   });
 
+  it('renders date-styled xlsx cells as ISO dates instead of day serials', async () => {
+    const text = await extractDocumentText(await buildXlsxFixture(), 'xlsx');
+    expect(text).toContain('1970-01-01'); // builtin date format (id 14)
+    expect(text).toContain('2025-08-05'); // custom dd-mm-yyyy format (id 164)
+    expect(text).not.toContain('25569');
+    expect(text).not.toContain('45874');
+    expect(text).toContain('1234.5'); // unstyled numeric cells stay numbers
+  });
+
   it('extracts pptx slide text in presentation order with speaker notes', async () => {
     const text = await extractDocumentText(await buildPptxFixture(), 'pptx');
     expect(text).toContain('[Slide 1]');
@@ -265,6 +293,15 @@ describe('document kinds and OOXML extraction', () => {
     expect(text).toContain('Husk talegenkendelse');
     // rId2 points at slide2.xml and is listed first: presentation order wins.
     expect(text.indexOf('Bilag: tal')).toBeLessThan(text.indexOf('Strategi 2027'));
+  });
+
+  it('extracts SmartArt diagram text from the diagram data parts', async () => {
+    const text = await extractDocumentText(await buildPptxFixture(), 'pptx');
+    expect(text).toContain('[Diagram]');
+    expect(text).toContain('Organisation og ledelse');
+    expect(text).toContain('Fase 2 udvidelse');
+    // Diagram sections come after the slides they belong to.
+    expect(text.indexOf('[Diagram]')).toBeGreaterThan(text.indexOf('[Slide 1]'));
   });
 
   it('reports password-protected or corrupt OOXML packages clearly', async () => {

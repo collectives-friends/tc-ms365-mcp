@@ -28,6 +28,7 @@ export const OOXML_MAX_TEXT_CHARS = 2_000_000;
 export const MAX_UNCOMPRESSED_PART_BYTES = 32 * 1024 * 1024;
 
 const RELATIONSHIPS_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+const DRAWINGML_NS = 'http://schemas.openxmlformats.org/drawingml/2006/main';
 
 // Minimal structural types for the lazily imported dependencies, in the same
 // spirit as document-text.ts's mammoth/unpdf shims: the server only relies on
@@ -51,6 +52,7 @@ interface ZipArchive {
 interface XmlNode {
   nodeType: number;
   localName?: string | null;
+  namespaceURI?: string | null;
   childNodes: ArrayLike<XmlNode>;
   textContent?: string | null;
   getAttribute?(name: string): string | null;
@@ -241,6 +243,8 @@ export async function extractXlsxText(
   }
   const workbookRels = await readRelationships(zip, 'xl/_rels/workbook.xml.rels', maxPartBytes);
   const sharedStrings = await readSharedStrings(zip, maxPartBytes);
+  const stylesXml = await readPart(zip, 'xl/styles.xml', maxPartBytes);
+  const dateStyles = stylesXml ? dateStyleIndexes(stylesXml) : new Set<number>();
 
   const sections: string[] = [];
   const total = { value: 0 };
@@ -252,7 +256,7 @@ export async function extractXlsxText(
     const partPath = target ? resolvePart('xl/workbook.xml', target) : undefined;
     const partXml = partPath ? await readPart(zip, partPath, maxPartBytes) : undefined;
     if (!partXml) continue;
-    const lines = sheetTextLines(await parseXml(partXml), sharedStrings);
+    const lines = sheetTextLines(await parseXml(partXml), sharedStrings, dateStyles);
     if (lines.length === 0) continue;
     if (!appendSection(sections, `[Sheet: ${sheetName}]\n${lines.join('\n')}`, total)) break;
   }
@@ -275,7 +279,50 @@ async function readSharedStrings(
 
 const MAX_XLSX_COLUMNS = 256;
 
-function sheetTextLines(worksheet: XmlNode, sharedStrings: string[]): string[] {
+/**
+ * Style indexes (into cellXfs) whose number format renders a date, so numeric
+ * cells with those styles can be shown as dates instead of day serials.
+ */
+function dateStyleIndexes(stylesXml: string): Set<number> {
+  const custom = new Map<number, string>();
+  for (const tag of stylesXml.matchAll(/<numFmt\b[^>]*>/g)) {
+    const id = /numFmtId="(\d+)"/.exec(tag[0])?.[1];
+    const code = /formatCode="([^"]*)"/.exec(tag[0])?.[1];
+    if (id && code !== undefined) custom.set(Number.parseInt(id, 10), code);
+  }
+  const indexes = new Set<number>();
+  const cellXfs = /<cellXfs[^>]*>([\s\S]*?)<\/cellXfs>/.exec(stylesXml);
+  if (!cellXfs) return indexes;
+  let index = 0;
+  for (const xf of cellXfs[1].matchAll(/<xf\b[^>]*\/?>/g)) {
+    const numFmtId = Number.parseInt(/numFmtId="(\d+)"/.exec(xf[0])?.[1] ?? '0', 10);
+    const format = custom.get(numFmtId) ?? '';
+    const builtinDate = (numFmtId >= 14 && numFmtId <= 22) || (numFmtId >= 45 && numFmtId <= 47);
+    const stripped = format
+      .replace(/"[^"]*"/g, '')
+      .replace(/\[[^\]]*\]/g, '')
+      .replace(/\\./g, '');
+    const customDate = /y{2,}|(?:^|[^a-z])d(?:d)?(?:[^a-z]|$)/i.test(stripped);
+    if (builtinDate || (format !== '' && customDate)) indexes.add(index);
+    index += 1;
+  }
+  return indexes;
+}
+
+/** Excel's 1900-system day serial (1899-12-30 epoch) rendered as an ISO date. */
+function excelSerialToIso(serial: number): string | undefined {
+  const days = Math.floor(serial);
+  if (!Number.isFinite(days) || days <= 0 || days > 2_958_465) return undefined;
+  const date = new Date(Date.UTC(1899, 11, 30) + days * 86_400_000);
+  if (Number.isNaN(date.getTime())) return undefined;
+  return date.toISOString().slice(0, 10);
+}
+
+function sheetTextLines(
+  worksheet: XmlNode,
+  sharedStrings: string[],
+  dateStyles: Set<number>
+): string[] {
   // `worksheet` is the parsed document node, so <sheetData> sits one level
   // down under the <worksheet> root: search descendants, not direct children.
   const sheetData = descendants(worksheet, 'sheetData')[0];
@@ -290,7 +337,7 @@ function sheetTextLines(worksheet: XmlNode, sharedStrings: string[]): string[] {
       const column = columnIndex(cell.getAttribute?.('r')) ?? nextColumn;
       nextColumn = column + 1;
       if (column >= MAX_XLSX_COLUMNS) continue;
-      const text = cellText(cell, sharedStrings);
+      const text = cellText(cell, sharedStrings, dateStyles);
       if (text) values[column] = text;
     }
     const lastFilled = lastFilledIndex(values);
@@ -324,7 +371,7 @@ function columnIndex(reference: string | null | undefined): number | undefined {
   return index - 1;
 }
 
-function cellText(cell: XmlNode, sharedStrings: string[]): string {
+function cellText(cell: XmlNode, sharedStrings: string[], dateStyles: Set<number>): string {
   const type = cell.getAttribute?.('t') ?? '';
   if (type === 's') {
     const index = Number.parseInt(firstChild(cell, 'v')?.textContent ?? '', 10);
@@ -342,6 +389,15 @@ function cellText(cell: XmlNode, sharedStrings: string[]): string {
   // <v> text and booleans get a readable rendering.
   const value = firstChild(cell, 'v')?.textContent ?? '';
   if (type === 'b') return value === '1' ? 'TRUE' : value === '0' ? 'FALSE' : value;
+  // A numeric cell with a date style: Excel keeps the value as a day serial,
+  // which nobody can search for, so render it as an ISO date instead.
+  if (value && dateStyles.size > 0 && /^\d+(\.\d+)?$/.test(value)) {
+    const style = Number.parseInt(cell.getAttribute?.('s') ?? '', 10);
+    if (Number.isInteger(style) && dateStyles.has(style)) {
+      const iso = excelSerialToIso(Number(value));
+      if (iso) return iso;
+    }
+  }
   return value;
 }
 
@@ -391,11 +447,30 @@ export async function extractPptxText(
     if (notes) parts.push('[Notes]', notes);
     if (!appendSection(sections, parts.join('\n'), total)) break;
   }
+
+  // SmartArt and other diagram text lives in the diagram data parts and is not
+  // mirrored into the slide XML, so read each data model as its own section.
+  const diagramParts = Object.keys(zip.files)
+    .filter((name) => /^ppt\/diagrams\/data\d+\.xml$/.test(name))
+    .sort((a, b) => diagramOrdinal(a) - diagramOrdinal(b));
+  for (const part of diagramParts) {
+    if (total.value >= OOXML_MAX_TEXT_CHARS) break;
+    const xml = await readPart(zip, part, maxPartBytes);
+    if (!xml) continue;
+    const diagramText = flattenDrawingText(await parseXml(xml));
+    if (!diagramText) continue;
+    if (!appendSection(sections, `[Diagram]\n${diagramText}`, total)) break;
+  }
   return sections.join('\n\n');
 }
 
 function slideOrdinal(path: string): number {
   const match = /slide(\d+)\.xml$/.exec(path);
+  return match ? Number.parseInt(match[1], 10) : 0;
+}
+
+function diagramOrdinal(path: string): number {
+  const match = /data(\d+)\.xml$/.exec(path);
   return match ? Number.parseInt(match[1], 10) : 0;
 }
 
@@ -430,7 +505,10 @@ function flattenDrawingText(root: XmlNode): string {
       const child = node.childNodes[i];
       if (!child || !isElement(child)) continue;
       const name = child.localName;
-      if (name === 't') {
+      // A drawing text run (<a:t>). Diagram data parts wrap their paragraphs in
+      // <dgm:t>, which shares the local name but carries the runs one level
+      // below, so only a run in the DrawingML namespace is appended directly.
+      if (name === 't' && (child.namespaceURI ?? DRAWINGML_NS) === DRAWINGML_NS) {
         line += child.textContent ?? '';
         continue;
       }
