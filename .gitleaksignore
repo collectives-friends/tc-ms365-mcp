@@ -1,3 +1,6 @@
 # Reviewed false positives (docs/test fixtures/placeholders/built-in role GUID), 2026-10-11
 489333dda5af58a9ad756a044e84c9b34e104820:examples/azure-container-apps/main.bicep:generic-api-key:79
 fd5e0e29a7e2a10a2d9f83a07ded0bf26d3fc718:README.md:curl-auth-header:107
+
+# Upstream test fixture (log-redactor tests build a synthetic JWT), 2026-10-12
+9f573b49d85fe79cd12921f39497685ff21d1818:test/log-redactor.test.ts:jwt:6

@@ -2,20 +2,29 @@ import fs from 'fs';
 import path from 'path';
 import { execSync } from 'child_process';
 
-export function generateMcpTools(openApiSpec, outputDir) {
-  try {
-    console.log('Generating client code from OpenAPI spec using openapi-zod-client...');
+/**
+ * Converts single-quoted `path:` strings that contain function-style OData segments with
+ * quoted parameters (e.g. `range(address=':address')`) into template literals, so the
+ * nested single quotes no longer break the generated TypeScript. A function may take
+ * several parameters, quoted or not, in any order:
+ * `getAllTranscripts(userId=':userId',startDateTime=:startDateTime)`.
+ */
+export function fixFunctionStylePaths(clientCode) {
+  return clientCode.replace(/(path:\s*)'(\/[^']*\([^)]*=':[\w]+'[^)]*\)[^']*)'/g, '$1`$2`');
+}
 
+export function generateMcpTools(openapiTrimmedFile, clientFilePath) {
+  try {
+    console.log(
+      `Generating ${path.basename(clientFilePath)} from ${path.basename(openapiTrimmedFile)} using openapi-zod-client...`
+    );
+
+    const outputDir = path.dirname(clientFilePath);
     if (!fs.existsSync(outputDir)) {
       fs.mkdirSync(outputDir, { recursive: true });
       console.log(`Created directory: ${outputDir}`);
     }
 
-    const rootDir = path.resolve(outputDir, '../..');
-    const openapiDir = path.join(rootDir, 'openapi');
-    const openapiTrimmedFile = path.join(openapiDir, 'openapi-trimmed.yaml');
-
-    const clientFilePath = path.join(outputDir, 'client.ts');
     execSync(
       `npx -y openapi-zod-client "${openapiTrimmedFile}" -o "${clientFilePath}" --with-description --strict-objects --additional-props-default-value=false`,
       {
@@ -49,7 +58,7 @@ export function generateMcpTools(openApiSpec, outputDir) {
     // to backticks (template literal) so single quotes can remain inside.
     // Match: path: '/...range(param=':value')...',
     // Replace with: path: `/...range(param=':value')...`,
-    clientCode = clientCode.replace(/(path:\s*)'(\/[^']*\([^)]*=':[\w]+'\)[^']*)'/g, '$1`$2`');
+    clientCode = fixFunctionStylePaths(clientCode);
 
     // openapi-zod-client emits z.instanceof(File) for `format: binary` bodies; MCP
     // transports JSON so no caller produces File. Body marshaller decodes the string.
@@ -59,6 +68,11 @@ export function generateMcpTools(openApiSpec, outputDir) {
     );
 
     fs.writeFileSync(clientFilePath, clientCode);
+
+    // Format the generated client so `npm run generate` output is prettier-stable and
+    // the format:check step in `npm run verify` passes deterministically across versions.
+    console.log('Formatting generated client with Prettier...');
+    execSync(`npx prettier --write "${clientFilePath}"`, { stdio: 'inherit' });
 
     return true;
   } catch (error) {
