@@ -17,7 +17,7 @@ Fork af `softeria/ms-365-mcp-server` (npm-navn stadig `@softeria/ms-365-mcp-serv
 
 ## Secrets · Key Vault + Sliplane env
 
-- Source of truth: Azure Key Vault `tc-data-kv-tc`, names `ms365-mcp-server--<ENV-NAME>` (underscores → dashes), 1:1 with the env names (MS365_MCP_CLIENT_ID/\_SECRET/\_TENANT_ID/\_ORG_MODE/\_PUBLIC_URL/\_ALLOWED_REDIRECT_URIS). Tagged with expires.
+- Source of truth: Azure Key Vault `tc-data-kv` (subscription `1668f090-c347-4ef4-b896-b770b044afb0`): `MS365_MCP_CLIENT_SECRET` → `ms365-mcp-server-ms365-mcp-client-secret`. The non-secret env (CLIENT_ID/TENANT_ID/ORG_MODE/PUBLIC_URL/ALLOWED_REDIRECT_URIS) lives only in Sliplane. The old vault `tc-data-kv-tc` is unreachable (its subscription was disabled, 23/10).
 - Runtime: values are set as Sliplane env (secret=true for CLIENT_SECRET). The container starts with `node dist/index.js --http :3000`. Infisical is no longer used (it was shut down 2026-10).
 - Entra app: TC Claude Code (ee95c1be-…). On client-secret rotation: new secret → KV → Sliplane env → redeploy.
 
