@@ -4,8 +4,8 @@ Status on 24 October 2026: prepared, not cut over. Both source and destination
 subscriptions have been observed active. No service env, image, OAuth app,
 token cache or runtime configuration has been changed by this migration.
 
-| Binding | Current source | Destination |
-| --- | --- | --- |
+| Binding                   | Current source                                        | Destination                                              |
+| ------------------------- | ----------------------------------------------------- | -------------------------------------------------------- |
 | `MS365_MCP_CLIENT_SECRET` | `tc-data-kv/ms365-mcp-server-ms365-mcp-client-secret` | `tc-data-kv-tc/ms365-mcp-server-ms365-mcp-client-secret` |
 
 Source subscription: `1668f090-c347-4ef4-b896-b770b044afb0`, DC tenant
