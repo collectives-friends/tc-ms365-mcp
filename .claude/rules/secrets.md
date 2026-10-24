@@ -1,28 +1,21 @@
-# Secrets — bor i Infisical, ikke i .env
+# Secrets: Azure Key Vault and Sliplane env
 
-**Source of truth for ALLE secrets er self-hosted Infisical:** `https://infisical.sliplane.app`,
-projekt `true-collective` (id `33338719-29b2-4069-9a39-54b0ab851ec9`), environment `prod`.
-Hver service har sin egen folder (se `INFISICAL_PATH` i platform-env).
+Follow `AGENTS.md` and `docs/tc-vault-migration.md`. Infisical was retired in
+October 2026; do not restore its bootstrap variables or entrypoint.
 
-## NEVER
-- Hardkod aldrig en secret i kode, Dockerfile, config eller markdown.
-- Commit aldrig en `.env` med rigtige værdier (kun `.env.example` med tomme `KEY=`).
-- Læg aldrig en secret direkte i Sliplane/platform-env. Det ENESTE der må stå i platform-env
-  er Infisical-bootstrap-vars (nedenfor) + ikke-hemmelig config (porte, URLs, feature-flags).
+The current deploy source is `tc-data-kv` in subscription
+`1668f090-c347-4ef4-b896-b770b044afb0`, Dreamers Collective tenant. The public
+server's `MS365_MCP_CLIENT_SECRET` maps to
+`ms365-mcp-server-ms365-mcp-client-secret`. Runtime uses the existing Sliplane
+env copy. Non-secret app/tenant/redirect configuration stays in Sliplane.
 
-## ALWAYS — sådan henter servicen secrets
-1. Servicen har en **machine identity** (Universal Auth) i Infisical med read-adgang til sin folder.
-2. Platform-env indeholder KUN: `INFISICAL_CLIENT_ID`, `INFISICAL_CLIENT_SECRET` (secret),
-   `INFISICAL_API_URL` (`https://infisical.sliplane.app/api`), `INFISICAL_PROJECT_ID`,
-   `INFISICAL_ENV=prod`, `INFISICAL_PATH=/<denne-service>`.
-3. Containeren starter via `infisical-entrypoint.sh` (logger ind + `infisical run` injicerer
-   secrets som env-vars). Appen er Infisical-uvidende.
+TC's own destination is `tc-data-kv-tc`, subscription
+`1ce4dbd9-c69b-45aa-9718-e29e4efd232d`, tenant
+`f783e0f3-09c8-458b-aaa1-d46d8e870e16`. This is a staged migration, not a
+completed cutover. Preserve DC's separate `dc-data-kv` and all its consumers.
 
-## Lokal udvikling
-`brew install infisical/get-cli/infisical`, så:
-`infisical run --projectId=33338719-29b2-4069-9a39-54b0ab851ec9 --env=prod \
-  --domain=https://infisical.sliplane.app/api --path=/<service> -- <start-kommando>`
-
-## Ny secret?
-Tilføj den i Infisical i servicens folder — IKKE i `.env` eller platform-env.
-Tilgængelig ved næste deploy/genstart.
+Never commit or print values, token-bearing URLs or hashes of credentials.
+Never treat `<redacted>` as a credential. Copy unchanged values only after
+checking the exact source and target; do not overwrite differing target copies.
+Changing Sliplane env or deploying requires the approved release flow and
+functional checks; it is not part of storage staging.
