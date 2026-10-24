@@ -1,8 +1,17 @@
 # TC vault migration: public Microsoft 365 MCP
 
 Status on 24 October 2026: prepared, not cut over. Both source and destination
-subscriptions have been observed active. No service env, image, OAuth app,
-token cache or runtime configuration has been changed by this migration.
+subscriptions have been observed active. No service env, image, OAuth app
+or runtime configuration has been changed by this migration. Existing token
+caches were retained; normal token refresh was allowed during read tests.
+
+The public app secret and non-secret app/tenant IDs now match the active
+process environment. The destination secret was also compared independently
+with its source version through Azure API reads. A delegated TC Graph token
+authenticated to this public MCP server and `get-current-user` returned the
+expected TC user; unauthenticated MCP calls returned 401. The full browser
+OAuth callback flow through the existing Claude client is still pending.
+No callback URI or consent configuration has been changed for the test.
 
 | Binding                   | Current source                                        | Destination                                              |
 | ------------------------- | ----------------------------------------------------- | -------------------------------------------------------- |
