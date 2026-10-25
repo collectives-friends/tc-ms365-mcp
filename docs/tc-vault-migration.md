@@ -1,6 +1,12 @@
 # TC vault migration: public Microsoft 365 MCP
 
-Status on 24 October 2026: prepared, not cut over. Both source and destination
+Selected source for future manual secret maintenance: TC vault `tc-data-kv-tc`.
+The user authorized this source-only selection on 25 October 2026 and explicitly
+waived the Claude browser callback test. This changes the operative source
+procedure, not the running process or a provider-side env binding. No automatic
+external vault sync was identified. The 24 October acceptance below remains
+historical; a fresh 25 October comparison verified the same ten source/target
+values and unchanged version IDs before activation. Both source and destination
 subscriptions have been observed active. No service env, image, OAuth app
 or runtime configuration has been changed by this migration. Existing token
 caches were retained; normal token refresh was allowed during read tests.
@@ -10,10 +16,11 @@ process environment. The destination secret was also compared independently
 with its source version through Azure API reads. A delegated TC Graph token
 authenticated to this public MCP server and `get-current-user` returned the
 expected TC user; unauthenticated MCP calls returned 401. The full browser
-OAuth callback flow through the existing Claude client is still pending.
-No callback URI or consent configuration has been changed for the test.
+OAuth callback flow through the existing Claude client was not tested and
+was explicitly waived by the user for this source-only change. It is not
+recorded as passed. No callback URI or consent configuration was changed.
 
-| Binding                   | Current source                                        | Destination                                              |
+| Binding                   | Retained rollback source                              | Selected TC source                                       |
 | ------------------------- | ----------------------------------------------------- | -------------------------------------------------------- |
 | `MS365_MCP_CLIENT_SECRET` | `tc-data-kv/ms365-mcp-server-ms365-mcp-client-secret` | `tc-data-kv-tc/ms365-mcp-server-ms365-mcp-client-secret` |
 
@@ -29,14 +36,16 @@ name. Do not overwrite it or assume equality. Stage the current source under
 the exact destination name above and compare values in memory, recording only
 version IDs and equality. The ten-binding, read-only preflight is maintained
 in `tc-multica/scripts/keyvault_migration.py` with `vault-migration.json`.
-Its migration switch is initially disabled; that switch does not configure
-this service's external deploy process.
+Its reviewed activation enables selected Multica adapter reads; that switch
+does not configure this service's external deploy process. Select the exact
+TC target above for future manual secret maintenance; retain the DC source for rollback.
 
 Sliplane's secret field is redacted in the UI. A source/destination match is
 not proof of live runtime equality. Accept an authorized runtime comparison
-and a public MCP OAuth flow followed by a read-only Graph call before changing
-the deploy source. Align the actual external deployment procedure with the
-new vault before considering cutover complete.
+and a read-only Graph call. The direct authenticated server test passed on
+24 October; the user waived the separate Claude browser callback test for
+this source-only selection. Future manual secret maintenance must read the
+exact TC vault/secret above. This does not install or modify an external deployer.
 
 Keep client ID `ee95c1be-8f3e-49ef-9798-0f2675b0e5be`, the TC tenant ID and
 existing redirect/public URLs unchanged. The private Multica MCP uses a
