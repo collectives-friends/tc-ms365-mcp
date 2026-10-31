@@ -1,17 +1,39 @@
 name: docker-publish
 on:
-  workflow_dispatch:
-  push:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
     branches: [main]
-    paths: ['Dockerfile', 'src/**', 'package*.json', '.github/workflows/docker-publish.yml']
 jobs:
+  gate:
+    # event == push udelukker PR'er fra forks, hvis head-branch også hedder main.
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main'
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+    outputs:
+      changed: ${{ steps.paths.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 2
+      # ponytail: ser kun på sidste commit; rebase-merge kan skjule kildeændringer, så slå det fra eller diff hele pushet.
+      - id: paths
+        run: |
+          files=$(git diff --name-only HEAD^ HEAD -- Dockerfile src bin tsconfig.json tsup.config.ts 'package*.json')
+          echo "changed=$([ -n "$files" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
   build-push:
+    needs: gate
+    if: needs.gate.outputs.changed == 'true'
     runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     permissions:
       contents: read
       packages: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
@@ -23,12 +45,33 @@ jobs:
           context: .
           push: true
           tags: ghcr.io/collectives-friends/tc-ms365-mcp:latest
+      - name: Check that this is still the newest commit on main
+        id: latest
+        env:
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          latest=$(git ls-remote origin refs/heads/main | cut -f1)
+          [ -n "$latest" ]
+          if [ "$latest" = "$HEAD_SHA" ]; then
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::Springer redeploy over: $HEAD_SHA er ikke længere nyeste commit på main ($latest)."
+            echo "current=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Trigger Sliplane redeploy
+        if: steps.latest.outputs.current == 'true'
         env: { HOOK: "${{ secrets.SLIPLANE_DEPLOY_HOOK }}" }
-        run: '[ -n "$HOOK" ] && curl -fsS "$HOOK" && echo redeploy-ok || echo "no hook secret set"'
+        run: |
+          if [ -z "$HOOK" ]; then
+            echo "::error::Secret SLIPLANE_DEPLOY_HOOK er tom eller mangler."
+            exit 1
+          fi
+          curl -fsS -o /dev/null "$HOOK"
       - name: Wait for rollout
+        if: steps.latest.outputs.current == 'true'
         run: sleep 50
       - name: Smoke test
+        if: steps.latest.outputs.current == 'true'
         run: |
           BASE=https://ms365-mcp-server.sliplane.app
           c=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/.well-known/oauth-authorization-server")
