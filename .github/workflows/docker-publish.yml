@@ -45,34 +45,32 @@ jobs:
           context: .
           push: true
           tags: ghcr.io/collectives-friends/tc-ms365-mcp:latest
-      - name: Check that this is still the newest commit on main
-        id: latest
+  # Uafhængig af stifilteret: branchen følger hvert grønt commit, og Sliplanes include paths afgør, om der deployes.
+  advance-release:
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.repository == 'collectives-friends/tc-ms365-mcp'
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    concurrency:
+      group: release-production
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - name: Fast-forward release/production to the tested commit
         env:
-          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
-          latest=$(git ls-remote origin refs/heads/main | cut -f1)
-          [ -n "$latest" ]
-          if [ "$latest" = "$HEAD_SHA" ]; then
-            echo "current=true" >> "$GITHUB_OUTPUT"
+          head=$(gh api "repos/$REPO/git/ref/heads/main" --jq .object.sha)
+          if [ "$head" != "$SHA" ]; then
+            echo "::notice::Springer over: $SHA er ikke længere nyeste commit på main ($head)."
+            exit 0
+          fi
+          if gh api "repos/$REPO/git/ref/heads/release/production" >/dev/null 2>&1; then
+            # force=false: GitHub afviser alt andet end fast-forward, så en ældre kørsel ikke kan spole tilbage.
+            gh api -X PATCH "repos/$REPO/git/refs/heads/release/production" -f sha="$SHA" -F force=false >/dev/null
           else
-            echo "::notice::Springer redeploy over: $HEAD_SHA er ikke længere nyeste commit på main ($latest)."
-            echo "current=false" >> "$GITHUB_OUTPUT"
+            gh api -X POST "repos/$REPO/git/refs" -f ref=refs/heads/release/production -f sha="$SHA" >/dev/null
           fi
-      - name: Trigger Sliplane redeploy
-        if: steps.latest.outputs.current == 'true'
-        env: { HOOK: "${{ secrets.SLIPLANE_DEPLOY_HOOK }}" }
-        run: |
-          if [ -z "$HOOK" ]; then
-            echo "::error::Secret SLIPLANE_DEPLOY_HOOK er tom eller mangler."
-            exit 1
-          fi
-          curl -fsS -o /dev/null "$HOOK"
-      - name: Wait for rollout
-        if: steps.latest.outputs.current == 'true'
-        run: sleep 50
-      - name: Smoke test
-        if: steps.latest.outputs.current == 'true'
-        run: |
-          BASE=https://ms365-mcp-server.sliplane.app
-          c=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/.well-known/oauth-authorization-server")
-          echo "discovery=$c"; test "$c" = "200"
+          echo "release/production -> $SHA"
